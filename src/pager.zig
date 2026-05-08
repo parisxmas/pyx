@@ -161,6 +161,12 @@ pub const Pager = struct {
     txn_append_hint: ?PageId,
     next_lsn: u64,
     sync_mode: SyncMode,
+    /// Lock-free doc-id allocator used by OCC writers that don't hold the
+    /// data lock. Initialised from `header.next_doc_id` at open and
+    /// after WAL replay; the on-disk header is brought back into sync at
+    /// the start of every `commitAppend` so the COMMIT record reflects
+    /// every reservation made before the commit.
+    next_doc_id_atomic: std.atomic.Value(u64),
 
     pub fn open(allocator: Allocator, io: Io, dir: Dir, sub_path: []const u8) !Pager {
         const file = try dir.createFile(io, sub_path, .{
@@ -210,6 +216,7 @@ pub const Pager = struct {
             .txn_append_hint = null,
             .next_lsn = 1,
             .sync_mode = .full,
+            .next_doc_id_atomic = .init(header.next_doc_id),
         };
     }
 
@@ -312,6 +319,15 @@ pub const Pager = struct {
     /// unified `commit`).
     pub fn commitAppend(self: *Pager) !u64 {
         if (!self.in_txn) return Error.NoActiveTxn;
+
+        // Bring the in-memory header up to whatever doc-id reservations
+        // happened concurrently via `reserveDocId` (used by lock-free OCC
+        // writers). This is a load-and-bump on the atomic; no contention.
+        const reserved = self.next_doc_id_atomic.load(.monotonic);
+        if (reserved > self.header.next_doc_id) {
+            self.header.next_doc_id = reserved;
+            self.header_dirty = true;
+        }
 
         if (self.header_dirty) {
             const gop = try self.dirty.getOrPut(self.allocator, 0);
@@ -521,25 +537,45 @@ pub const Pager = struct {
     }
 
     pub fn nextDocId(self: *Pager) !u64 {
+        const id = self.next_doc_id_atomic.fetchAdd(1, .monotonic);
         if (self.in_txn) {
-            const id = self.header.next_doc_id;
-            self.header.next_doc_id += 1;
-            self.header_dirty = true;
+            // Header sync is handled by commitAppend — leaving the
+            // header field stale here is fine and avoids redundant
+            // writes when the same txn allocates many ids.
             return id;
         }
         try self.begin();
         errdefer self.abort();
-        const id = self.header.next_doc_id;
-        self.header.next_doc_id += 1;
-        self.header_dirty = true;
         try self.commit();
         return id;
+    }
+
+    /// Lock-free doc-id reservation for OCC writers that don't hold the
+    /// data lock. The id is reflected in the on-disk header on the next
+    /// pessimistic commit (which includes the apply phase of an OCC
+    /// commit), so a crash before that commit drops the reservation —
+    /// acceptable, since the OCC txn would also have lost its
+    /// uncommitted writes.
+    pub fn reserveDocId(self: *Pager) u64 {
+        return self.next_doc_id_atomic.fetchAdd(1, .monotonic);
     }
 
     pub fn restoreNextDocId(self: *Pager, value: u64) void {
         if (value > self.header.next_doc_id) {
             self.header.next_doc_id = value;
             self.header_dirty = true;
+        }
+        // Keep the atomic counter in sync with replayed state so any
+        // post-replay reservation outranks the recovered value.
+        while (true) {
+            const cur = self.next_doc_id_atomic.load(.monotonic);
+            if (cur >= value) break;
+            if (self.next_doc_id_atomic.cmpxchgWeak(
+                cur,
+                value,
+                .monotonic,
+                .monotonic,
+            ) == null) break;
         }
     }
 

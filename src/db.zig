@@ -216,21 +216,35 @@ pub const Db = struct {
     }
 
     /// Begin an optimistic-concurrency transaction. The returned `Txn`
-    /// captures the current B+Tree root as its snapshot, accumulates
-    /// writes into a private buffer, and validates them against the live
-    /// tree at `commit()`.
+    /// captures a `Snapshot` of the current B+Tree, accumulates writes
+    /// into a private buffer, and validates them against the live tree
+    /// at `commit()`.
     ///
-    /// Phase 1: still serialises on `db.mu` (so behaviour matches
-    /// `begin()`/`commit()` exactly — the read_set/write_set are
-    /// recorded but unused). Phase 2 will release `db.mu` during the
-    /// read+work phase and validate at commit, returning
-    /// `error.WriteConflict` when validation fails.
+    /// Reads against the txn (`TxnCollection.get`) are lock-free —
+    /// they go through the snapshot's mmap view of the data file.
+    /// Writes are buffered in the txn's `write_set` and only touch the
+    /// live tree at commit time, after validation. Many txns can run
+    /// concurrently from different threads; only the brief commit
+    /// validate+apply step takes `db.mu`.
+    ///
+    /// On commit, validation re-reads each `read_set` entry against
+    /// the current live tree and verifies the value's hash matches
+    /// what was observed at begin time. Any divergence yields
+    /// `error.WriteConflict` and the caller should retry. Caveat:
+    /// blind writes (put/delete without a prior get of the same key)
+    /// are not protected from lost-update — read before writing if
+    /// you care.
     pub fn beginOptimistic(self: *Db) !OptimisticTxn {
-        try self.begin();
-        errdefer self.abort();
+        // Snapshot capture briefly takes db.mu inside `snapshot()` to
+        // checkpoint, then releases it. The returned Snapshot owns an
+        // mmap of the data file at the captured root, so subsequent
+        // reads from concurrent OCC txns are fully lock-free.
+        var snap = try self.snapshot();
+        errdefer snap.deinit();
         return .{
             .db = self,
-            .start_root = self.pager.bTreeRoot(),
+            .snapshot = snap,
+            .start_root = snap.btree_root,
             .arena = std.heap.ArenaAllocator.init(self.allocator),
             .read_set = .empty,
             .write_set = .empty,
@@ -772,23 +786,24 @@ pub const FindIterator = struct {
 
 /// An optimistic-concurrency transaction. Use `Db.beginOptimistic`.
 ///
-/// Each txn captures `start_root` at begin time. Reads of documents are
-/// recorded in `read_set` (with the doc's value hash); writes are
-/// recorded in `write_set` and applied to the live B+Tree.
+/// Reads of documents are recorded in `read_set` (with the doc's value
+/// hash) for commit-time validation. Writes are buffered in
+/// `write_set` and applied to the live B+Tree only at commit, after
+/// validation succeeds.
 ///
-/// Phase 1 caveats:
-///   - `db.mu` is held across the whole txn (still serialised).
-///   - Reads via `findOne`/`findAll`/`findRange`/`iterator` are NOT yet
-///     tracked in the read set — they're phantom-prone and need
-///     range-tracking support that lands later.
-///   - `read_set` / `write_set` are populated for plumbing, not yet
-///     consulted at commit. Phase 2 wires up validation.
+/// Read tracking is point-only in this version — `findOne` /
+/// `findAll` / `findRange` / `iterator` delegate to the snapshot
+/// without recording, so range-style reads inside a txn are
+/// phantom-prone (a concurrent committer can insert into the range
+/// without conflict). Range tracking lands in a later version.
 pub const OptimisticTxn = struct {
     db: *Db,
+    snapshot: Snapshot,
     start_root: pager_mod.PageId,
     arena: std.heap.ArenaAllocator,
     read_set: ArrayList(ReadSetEntry),
     write_set: ArrayList(WriteSetEntry),
+    done: bool = false,
 
     pub const WriteKind = enum { insert, put, delete };
 
@@ -796,8 +811,7 @@ pub const OptimisticTxn = struct {
         coll: []const u8, // owned by `arena`
         doc_id: u64,
         /// Wyhash of the doc bytes at read time, or 0 sentinel when the
-        /// read returned null. Validation in phase 2 re-reads and
-        /// compares.
+        /// read returned null.
         value_hash: u64,
     };
 
@@ -805,26 +819,79 @@ pub const OptimisticTxn = struct {
         coll: []const u8, // owned by `arena`
         doc_id: u64,
         kind: WriteKind,
+        /// New doc bytes for `insert`/`put`; empty slice for `delete`.
+        /// Owned by `arena`.
+        value: []const u8,
     };
 
     pub fn collection(self: *OptimisticTxn, name: []const u8) TxnCollection {
         return .{ .txn = self, .name = name };
     }
 
+    /// Validate the read set against the live tree, then apply the
+    /// write set under db.mu. Returns `error.WriteConflict` if any
+    /// observed value has changed since this txn began.
     pub fn commit(self: *OptimisticTxn) !void {
-        defer self.deinitBuffers();
+        defer self.deinitAll();
+
+        // Open a pessimistic txn for the validate+apply phase. Auto-
+        // commit ops on this thread re-enter through ownsTxn() and
+        // share the lock without relocking.
+        try self.db.begin();
+
+        self.validateAndApply() catch |err| {
+            self.db.abort();
+            return err;
+        };
+
+        // Db.commit reliably releases db.mu whether it returns ok or
+        // an error, so we do not call abort on its failure path.
         try self.db.commit();
     }
 
-    pub fn abort(self: *OptimisticTxn) void {
-        defer self.deinitBuffers();
-        self.db.abort();
+    fn validateAndApply(self: *OptimisticTxn) !void {
+        for (self.read_set.items) |entry| {
+            const coll = self.db.collection(entry.coll);
+            const live = try coll.get(self.db.allocator, entry.doc_id);
+            defer if (live) |v| self.db.allocator.free(v);
+            const live_hash: u64 = if (live) |v| std.hash.Wyhash.hash(0, v) else 0;
+            if (live_hash != entry.value_hash) return Error.WriteConflict;
+        }
+
+        for (self.write_set.items) |entry| {
+            const coll = self.db.collection(entry.coll);
+            switch (entry.kind) {
+                .insert, .put => try coll.put(entry.doc_id, entry.value),
+                .delete => _ = try coll.delete(entry.doc_id),
+            }
+        }
     }
 
-    fn deinitBuffers(self: *OptimisticTxn) void {
+    pub fn abort(self: *OptimisticTxn) void {
+        self.deinitAll();
+    }
+
+    /// Idempotent — safe to call from both `commit`'s defer and a
+    /// caller's errdefer-style `abort`. Subsequent calls are no-ops.
+    fn deinitAll(self: *OptimisticTxn) void {
+        if (self.done) return;
+        self.done = true;
         self.read_set.deinit(self.db.allocator);
         self.write_set.deinit(self.db.allocator);
         self.arena.deinit();
+        self.snapshot.deinit();
+    }
+
+    /// Search backwards through the write_set for the most recent op
+    /// on `(coll, doc_id)`. Used by reads-your-own-writes.
+    fn lookupOwnWrite(self: *OptimisticTxn, coll: []const u8, doc_id: u64) ?WriteSetEntry {
+        var i = self.write_set.items.len;
+        while (i > 0) {
+            i -= 1;
+            const e = self.write_set.items[i];
+            if (e.doc_id == doc_id and std.mem.eql(u8, e.coll, coll)) return e;
+        }
+        return null;
     }
 
     fn recordRead(self: *OptimisticTxn, coll: []const u8, doc_id: u64, value: ?[]const u8) !void {
@@ -837,55 +904,85 @@ pub const OptimisticTxn = struct {
         });
     }
 
-    fn recordWrite(self: *OptimisticTxn, coll: []const u8, doc_id: u64, kind: WriteKind) !void {
-        const owned = try self.arena.allocator().dupe(u8, coll);
+    fn recordWrite(
+        self: *OptimisticTxn,
+        coll: []const u8,
+        doc_id: u64,
+        kind: WriteKind,
+        value: []const u8,
+    ) !void {
+        const arena_allocator = self.arena.allocator();
+        const owned_coll = try arena_allocator.dupe(u8, coll);
+        const owned_value = if (value.len == 0) "" else try arena_allocator.dupe(u8, value);
         try self.write_set.append(self.db.allocator, .{
-            .coll = owned,
+            .coll = owned_coll,
             .doc_id = doc_id,
             .kind = kind,
+            .value = owned_value,
         });
     }
 };
 
-/// Collection handle bound to an `OptimisticTxn`. Mirrors `Collection`'s
-/// API; the difference is each call updates the txn's read/write sets.
+/// Collection handle bound to an `OptimisticTxn`. Reads go through the
+/// txn's snapshot (lock-free); writes are buffered in the txn until
+/// commit. Reads that find a matching staged write return that
+/// write's value (read-your-own-writes) without recording a read-set
+/// entry — what we'd validate is what we just wrote.
 pub const TxnCollection = struct {
     txn: *OptimisticTxn,
     name: []const u8,
 
-    fn underlying(self: TxnCollection) Collection {
-        return self.txn.db.collection(self.name);
-    }
-
     pub fn insert(self: TxnCollection, doc_bytes: []const u8) !u64 {
-        const id = try self.underlying().insert(doc_bytes);
-        try self.txn.recordWrite(self.name, id, .insert);
+        try validateName(self.name);
+        const id = self.txn.db.pager.reserveDocId();
+        try self.txn.recordWrite(self.name, id, .insert, doc_bytes);
         return id;
     }
 
     pub fn put(self: TxnCollection, doc_id: u64, doc_bytes: []const u8) !void {
-        try self.underlying().put(doc_id, doc_bytes);
-        try self.txn.recordWrite(self.name, doc_id, .put);
+        try validateName(self.name);
+        try self.txn.recordWrite(self.name, doc_id, .put, doc_bytes);
     }
 
     pub fn delete(self: TxnCollection, doc_id: u64) !bool {
-        const found = try self.underlying().delete(doc_id);
-        try self.txn.recordWrite(self.name, doc_id, .delete);
-        return found;
+        try validateName(self.name);
+        // We can't tell from the buffered state alone whether this
+        // doc_id exists in the live tree. Buffer the delete; the
+        // committed apply phase will short-circuit if it's missing.
+        try self.txn.recordWrite(self.name, doc_id, .delete, "");
+        return true;
     }
 
     pub fn get(self: TxnCollection, allocator: Allocator, doc_id: u64) !?[]u8 {
-        const result = try self.underlying().get(allocator, doc_id);
-        try self.txn.recordRead(self.name, doc_id, result);
-        return result;
+        try validateName(self.name);
+        // 1. Read-your-own-writes: latest staged op wins.
+        if (self.txn.lookupOwnWrite(self.name, doc_id)) |w| {
+            switch (w.kind) {
+                .delete => return null,
+                .insert, .put => return try allocator.dupe(u8, w.value),
+            }
+        }
+        // 2. Snapshot read against start_root. Lock-free.
+        const snap_coll = self.txn.snapshot.collection(self.name);
+        const value = try snap_coll.get(allocator, doc_id);
+        try self.txn.recordRead(self.name, doc_id, value);
+        return value;
     }
 
+    // Range / indexed reads are phantom-prone in this version — they
+    // pass through to the snapshot with no read-set tracking. A future
+    // version will add range tracking.
     pub fn iterator(self: TxnCollection, allocator: Allocator) !Iterator {
-        return self.underlying().iterator(allocator);
+        try validateName(self.name);
+        return self.txn.snapshot.collection(self.name).iterator(allocator);
     }
 
     pub fn count(self: TxnCollection, allocator: Allocator) !u64 {
-        return self.underlying().count(allocator);
+        var it = try self.iterator(allocator);
+        defer it.deinit();
+        var n: u64 = 0;
+        while (try it.next()) |_| n += 1;
+        return n;
     }
 
     pub fn findOne(
@@ -893,7 +990,8 @@ pub const TxnCollection = struct {
         field_path: []const u8,
         value: doc_mod.Value,
     ) !?u64 {
-        return self.underlying().findOne(field_path, value);
+        try validateName(self.name);
+        return self.txn.snapshot.collection(self.name).findOne(field_path, value);
     }
 
     pub fn findAll(
@@ -902,7 +1000,8 @@ pub const TxnCollection = struct {
         field_path: []const u8,
         value: doc_mod.Value,
     ) !index_mod.LookupIterator {
-        return self.underlying().findAll(allocator, field_path, value);
+        try validateName(self.name);
+        return self.txn.snapshot.collection(self.name).findAll(allocator, field_path, value);
     }
 
     pub fn findRange(
@@ -912,7 +1011,8 @@ pub const TxnCollection = struct {
         lo: index_mod.Bound,
         hi: index_mod.Bound,
     ) !index_mod.RangeIterator {
-        return self.underlying().findRange(allocator, field_path, lo, hi);
+        try validateName(self.name);
+        return self.txn.snapshot.collection(self.name).findRange(allocator, field_path, lo, hi);
     }
 };
 
@@ -1532,7 +1632,7 @@ test "concurrent inserts from multiple threads" {
 }
 
 
-test "OptimisticTxn: insert + get + commit roundtrip, read/write sets populated" {
+test "OptimisticTxn: insert + get + commit roundtrip; reads-your-own-writes" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const ally = testing.allocator;
@@ -1543,28 +1643,25 @@ test "OptimisticTxn: insert + get + commit roundtrip, read/write sets populated"
     defer ally.free(alice);
 
     var saved_id: u64 = undefined;
-    var saw_writes: usize = 0;
-    var saw_reads: usize = 0;
-
     {
         var txn = try db.beginOptimistic();
         errdefer txn.abort();
         const users = txn.collection("users");
         saved_id = try users.insert(alice);
 
+        // get() finds the staged write — read_set should NOT have an
+        // entry for this, because we'd be validating a value we just
+        // wrote ourselves.
         const got = (try users.get(ally, saved_id)).?;
         defer ally.free(got);
         try testing.expectEqualSlices(u8, alice, got);
 
-        // The txn captured the snapshot at begin time, before our insert.
-        // start_root is the empty B+tree root from a fresh DB.
         try testing.expectEqual(@as(usize, 1), txn.write_set.items.len);
-        try testing.expectEqual(@as(usize, 1), txn.read_set.items.len);
-        saw_writes = txn.write_set.items.len;
-        saw_reads = txn.read_set.items.len;
+        try testing.expectEqual(@as(usize, 0), txn.read_set.items.len);
         try testing.expectEqual(OptimisticTxn.WriteKind.insert, txn.write_set.items[0].kind);
         try testing.expectEqual(saved_id, txn.write_set.items[0].doc_id);
         try testing.expectEqualStrings("users", txn.write_set.items[0].coll);
+        try testing.expectEqualSlices(u8, alice, txn.write_set.items[0].value);
 
         try txn.commit();
     }
@@ -1573,8 +1670,120 @@ test "OptimisticTxn: insert + get + commit roundtrip, read/write sets populated"
     const after = (try db.collection("users").get(ally, saved_id)).?;
     defer ally.free(after);
     try testing.expectEqualSlices(u8, alice, after);
-    try testing.expectEqual(@as(usize, 1), saw_writes);
-    try testing.expectEqual(@as(usize, 1), saw_reads);
+}
+
+test "OptimisticTxn: get of unstaged doc records a read_set entry" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-read.db");
+    defer db.close();
+
+    // Pre-seed a doc, checkpoint so it's reachable from snapshot.
+    const seed = try buildDoc("seed", 7);
+    defer ally.free(seed);
+    const seed_id = try db.collection("c").insert(seed);
+    try db.checkpoint();
+
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    const c = txn.collection("c");
+
+    const got = (try c.get(ally, seed_id)).?;
+    defer ally.free(got);
+    try testing.expectEqualSlices(u8, seed, got);
+
+    // This was a snapshot read, not own-write.
+    try testing.expectEqual(@as(usize, 0), txn.write_set.items.len);
+    try testing.expectEqual(@as(usize, 1), txn.read_set.items.len);
+    try testing.expectEqual(seed_id, txn.read_set.items[0].doc_id);
+    try testing.expect(txn.read_set.items[0].value_hash != 0);
+
+    txn.abort();
+}
+
+test "OptimisticTxn: WriteConflict when read value changes between begin and commit" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-conflict.db");
+    defer db.close();
+
+    const v1 = try buildDoc("v1", 1);
+    defer ally.free(v1);
+    const v2 = try buildDoc("v2", 2);
+    defer ally.free(v2);
+
+    const seed_id = try db.collection("c").insert(v1);
+    try db.checkpoint();
+
+    // Txn A starts, reads v1 from snapshot.
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    const c = txn.collection("c");
+    const got = (try c.get(ally, seed_id)).?;
+    defer ally.free(got);
+    try testing.expectEqualSlices(u8, v1, got);
+
+    // While A is mid-work, another writer overwrites the doc.
+    try db.collection("c").put(seed_id, v2);
+
+    // Txn A queues a write of its own and tries to commit. Validation
+    // sees that seed_id no longer holds v1 → conflict.
+    try c.put(seed_id, v2);
+    try testing.expectError(Error.WriteConflict, txn.commit());
+}
+
+test "OptimisticTxn: two concurrent txns inserting disjoint docs both succeed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-disjoint.db");
+    defer db.close();
+
+    const a = try buildDoc("a", 1);
+    defer ally.free(a);
+    const b = try buildDoc("b", 2);
+    defer ally.free(b);
+
+    var ta = try db.beginOptimistic();
+    errdefer ta.abort();
+    const ca = ta.collection("c");
+    const id_a = try ca.insert(a);
+
+    var tb = try db.beginOptimistic();
+    errdefer tb.abort();
+    const cb = tb.collection("c");
+    const id_b = try cb.insert(b);
+
+    // Disjoint doc_ids (each came from the atomic counter).
+    try testing.expect(id_a != id_b);
+
+    try ta.commit();
+    try tb.commit();
+
+    try testing.expectEqual(@as(u64, 2), try db.collection("c").count(ally));
+}
+
+test "OptimisticTxn: delete of staged doc returns null on subsequent get" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-del.db");
+    defer db.close();
+
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    const c = txn.collection("c");
+    const d = try buildDoc("x", 1);
+    defer ally.free(d);
+    const id = try c.insert(d);
+
+    _ = try c.delete(id);
+
+    // After staged delete, get should see nothing.
+    try testing.expect((try c.get(ally, id)) == null);
+    txn.abort();
 }
 
 test "OptimisticTxn: abort discards writes" {
@@ -1616,3 +1825,49 @@ test "OptimisticTxn: start_root captured at begin reflects snapshot version" {
     txn.abort();
 }
 
+
+test "OptimisticTxn: 4 threads, disjoint inserts, all commit" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-concurrent.db");
+    defer db.close();
+
+    const Args = struct { db: *Db, base: u32, n: u32 };
+    const Worker = struct {
+        fn run(args: Args) !void {
+            var name_buf: [32]u8 = undefined;
+            var i: u32 = 0;
+            while (i < args.n) : (i += 1) {
+                var txn = try args.db.beginOptimistic();
+                errdefer txn.abort();
+                const c = txn.collection("c");
+                var b = Builder.init(testing.allocator);
+                defer b.deinit();
+                try b.beginDocument();
+                const name = try std.fmt.bufPrint(&name_buf, "w{d}-{d}", .{ args.base, i });
+                try b.putString("name", name);
+                try b.putI64("idx", @intCast(args.base * args.n + i));
+                try b.endDocument();
+                const bytes = try b.finish();
+                defer testing.allocator.free(bytes);
+                _ = try c.insert(bytes);
+                try txn.commit();
+            }
+        }
+    };
+
+    const num_threads = 4;
+    const per_thread = 25;
+    var threads: [num_threads]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| {
+        const args: Args = .{ .db = &db, .base = @intCast(i), .n = per_thread };
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{args});
+    }
+    for (threads) |t| t.join();
+
+    try testing.expectEqual(
+        @as(u64, num_threads * per_thread),
+        try db.collection("c").count(ally),
+    );
+}
