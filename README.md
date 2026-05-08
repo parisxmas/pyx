@@ -301,10 +301,11 @@ try db.runOptimistic(8, Bump{ .target_id = 5 }, Bump.run);
 
 Caveats:
 
-- **Range reads aren't tracked** (`findOne`, `findAll`, `findRange`,
-  `iterator`). They go through the snapshot but don't add to the read
-  set, so a concurrent insert into an observed range is a phantom.
-  Range tracking is on the roadmap.
+- **`Collection.iterator` (full-collection scan) is still untracked
+  inside an OCC txn** — phantom inserts into the iterated set won't
+  conflict. Indexed range reads (`findOne`, `findAll`, `findRange`)
+  *are* tracked. If you need full-scan tracking, define an index and
+  use `findRange`.
 - **`runOptimistic` does not back off** between attempts. Two threads
   contending on the same hot key can livelock the retry loop on each
   other; wrap with your own `std.Thread.sleep` if your workload has
@@ -316,6 +317,15 @@ so blind writes show up in the read set and a concurrent committer
 who modified the same key triggers `WriteConflict` at commit. Skip
 the read only when an earlier op in the same txn already covered the
 key (we've already seen its starting value).
+
+Phantom protection covers indexed reads: `findOne` records the first
+matching doc_id, `findAll` and `findRange` materialise the full match
+list at read time, and validation re-runs the same predicate against
+the live tree. A concurrent insert that becomes a new match, or
+modifies an existing match's indexed field so that it leaves the
+range, triggers `WriteConflict`. (`findAll`/`findRange` return a
+`TxnMatchIterator` over the captured slice instead of the
+`index_mod.RangeIterator` you'd get from a regular `Collection`.)
 
 ### Pessimistic-write ceiling
 
@@ -532,8 +542,10 @@ Python tests live under `bindings/python/tests/` and are run with
 - [x] OCC transactions (`Db.beginOptimistic` / `Db.runOptimistic`) —
       lock-free snapshot reads, buffered writes, conflict detection at
       commit. Lost-update protection for blind writes via implicit
-      snapshot read on `put`/`delete`. Range-read tracking is still
-      TODO.
+      snapshot read on `put`/`delete`. Phantom protection for indexed
+      reads (`findOne` / `findAll` / `findRange`) via match-list
+      replay at validation. Full-scan `iterator` tracking and
+      `runOptimistic` backoff still TODO.
 - [ ] Concurrent B+Tree mutations (per-page locks, keyspace sharding,
       or LSM) — break past the `db.mu` ceiling for `.full`-mode
       auto-commit throughput.

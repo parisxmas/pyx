@@ -866,7 +866,8 @@ pub const OptimisticTxn = struct {
     /// phantom = `WriteConflict`.
     pub const RangeReadEntry = union(enum) {
         find_one: FindOneEntry,
-        // find_range / find_all land in phase 2.
+        find_all: FindAllEntry,
+        find_range: FindRangeEntry,
     };
 
     pub const FindOneEntry = struct {
@@ -874,6 +875,25 @@ pub const OptimisticTxn = struct {
         field: []const u8,          // owned by `arena`
         value: doc_mod.Value,       // string/bytes payloads owned by `arena`
         first_match: ?u64,          // result observed at snapshot time
+    };
+
+    pub const FindAllEntry = struct {
+        coll: []const u8,           // owned by `arena`
+        field: []const u8,          // owned by `arena`
+        value: doc_mod.Value,       // string/bytes payloads owned by `arena`
+        /// All doc_ids matching `field == value` at snapshot time, in
+        /// ascending index order. Owned by `arena`.
+        matches: []const u64,
+    };
+
+    pub const FindRangeEntry = struct {
+        coll: []const u8,           // owned by `arena`
+        field: []const u8,          // owned by `arena`
+        lo: index_mod.Bound,        // string/bytes payloads owned by `arena`
+        hi: index_mod.Bound,
+        /// All doc_ids in [lo, hi] at snapshot time, in ascending index
+        /// order. Owned by `arena`.
+        matches: []const u64,
     };
 
     pub const WriteSetEntry = struct {
@@ -924,6 +944,16 @@ pub const OptimisticTxn = struct {
                 .find_one => |fo| {
                     const live_first = try self.db.collection(fo.coll).findOne(fo.field, fo.value);
                     if (live_first != fo.first_match) return Error.WriteConflict;
+                },
+                .find_all => |fa| {
+                    var it = try self.db.collection(fa.coll).findAll(self.db.allocator, fa.field, fa.value);
+                    defer it.deinit();
+                    if (!try liveMatchesEqual(&it, fa.matches)) return Error.WriteConflict;
+                },
+                .find_range => |fr| {
+                    var it = try self.db.collection(fr.coll).findRange(self.db.allocator, fr.field, fr.lo, fr.hi);
+                    defer it.deinit();
+                    if (!try liveMatchesEqual(&it, fr.matches)) return Error.WriteConflict;
                 },
             }
         }
@@ -1021,6 +1051,64 @@ pub const OptimisticTxn = struct {
             },
         });
     }
+
+    fn recordFindAll(
+        self: *OptimisticTxn,
+        coll: []const u8,
+        field: []const u8,
+        value: doc_mod.Value,
+        matches: []const u64,
+    ) !void {
+        const arena_allocator = self.arena.allocator();
+        try self.range_set.append(self.db.allocator, .{
+            .find_all = .{
+                .coll = try arena_allocator.dupe(u8, coll),
+                .field = try arena_allocator.dupe(u8, field),
+                .value = try dupeValue(arena_allocator, value),
+                .matches = try arena_allocator.dupe(u64, matches),
+            },
+        });
+    }
+
+    fn recordFindRange(
+        self: *OptimisticTxn,
+        coll: []const u8,
+        field: []const u8,
+        lo: index_mod.Bound,
+        hi: index_mod.Bound,
+        matches: []const u64,
+    ) !void {
+        const arena_allocator = self.arena.allocator();
+        try self.range_set.append(self.db.allocator, .{
+            .find_range = .{
+                .coll = try arena_allocator.dupe(u8, coll),
+                .field = try arena_allocator.dupe(u8, field),
+                .lo = try dupeBound(arena_allocator, lo),
+                .hi = try dupeBound(arena_allocator, hi),
+                .matches = try arena_allocator.dupe(u64, matches),
+            },
+        });
+    }
+};
+
+/// Iterator over the captured match list of an OCC `findAll` or
+/// `findRange`. yields doc_ids in the same ascending order the live
+/// index would. `deinit` is a no-op — matches are owned by the
+/// surrounding `OptimisticTxn`'s arena.
+pub const TxnMatchIterator = struct {
+    matches: []const u64,
+    pos: usize = 0,
+
+    pub fn deinit(self: *TxnMatchIterator) void {
+        _ = self;
+    }
+
+    pub fn next(self: *TxnMatchIterator) !?u64 {
+        if (self.pos >= self.matches.len) return null;
+        const id = self.matches[self.pos];
+        self.pos += 1;
+        return id;
+    }
 };
 
 /// Deep-copy a doc_mod.Value into the given allocator. The variants
@@ -1033,6 +1121,28 @@ fn dupeValue(arena: Allocator, v: doc_mod.Value) !doc_mod.Value {
         .bytes => |b| .{ .bytes = try arena.dupe(u8, b) },
         else => v,
     };
+}
+
+fn dupeBound(arena: Allocator, b: index_mod.Bound) !index_mod.Bound {
+    return switch (b) {
+        .none => .none,
+        .inclusive => |v| .{ .inclusive = try dupeValue(arena, v) },
+        .exclusive => |v| .{ .exclusive = try dupeValue(arena, v) },
+    };
+}
+
+/// Walk a live-tree iterator (`RangeIterator` or `LookupIterator`) and
+/// confirm it yields exactly the same doc_ids in the same order as
+/// `expected`. Used by the OCC commit to catch phantoms in `findAll`
+/// and `findRange`.
+fn liveMatchesEqual(it: anytype, expected: []const u64) !bool {
+    var i: usize = 0;
+    while (try it.next()) |id| {
+        if (i >= expected.len) return false; // live has more matches
+        if (id != expected[i]) return false; // diverged
+        i += 1;
+    }
+    return i == expected.len; // live had fewer matches if i < expected.len
 }
 
 /// Collection handle bound to an `OptimisticTxn`. Reads go through the
@@ -1140,9 +1250,18 @@ pub const TxnCollection = struct {
         allocator: Allocator,
         field_path: []const u8,
         value: doc_mod.Value,
-    ) !index_mod.LookupIterator {
+    ) !TxnMatchIterator {
         try validateName(self.name);
-        return self.txn.snapshot.collection(self.name).findAll(allocator, field_path, value);
+        var inner = try self.txn.snapshot.collection(self.name).findAll(allocator, field_path, value);
+        defer inner.deinit();
+        var list: ArrayList(u64) = .empty;
+        defer list.deinit(allocator);
+        while (try inner.next()) |id| try list.append(allocator, id);
+        try self.txn.recordFindAll(self.name, field_path, value, list.items);
+        // Hand back an iterator over the arena-owned copy so the caller
+        // can deinit `list` without leaking the txn's record.
+        const last = self.txn.range_set.items[self.txn.range_set.items.len - 1];
+        return .{ .matches = last.find_all.matches };
     }
 
     pub fn findRange(
@@ -1151,9 +1270,16 @@ pub const TxnCollection = struct {
         field_path: []const u8,
         lo: index_mod.Bound,
         hi: index_mod.Bound,
-    ) !index_mod.RangeIterator {
+    ) !TxnMatchIterator {
         try validateName(self.name);
-        return self.txn.snapshot.collection(self.name).findRange(allocator, field_path, lo, hi);
+        var inner = try self.txn.snapshot.collection(self.name).findRange(allocator, field_path, lo, hi);
+        defer inner.deinit();
+        var list: ArrayList(u64) = .empty;
+        defer list.deinit(allocator);
+        while (try inner.next()) |id| try list.append(allocator, id);
+        try self.txn.recordFindRange(self.name, field_path, lo, hi, list.items);
+        const last = self.txn.range_set.items[self.txn.range_set.items.len - 1];
+        return .{ .matches = last.find_range.matches };
     }
 };
 
@@ -2284,11 +2410,115 @@ test "OptimisticTxn: range_set entry recorded for each findOne call" {
     _ = try txn.collection("u").findOne("name", .{ .string = "bob" });
 
     try testing.expectEqual(@as(usize, 2), txn.range_set.items.len);
-    switch (txn.range_set.items[0]) {
-        .find_one => |fo| try testing.expectEqualStrings("alice", fo.value.string),
-    }
-    switch (txn.range_set.items[1]) {
-        .find_one => |fo| try testing.expectEqualStrings("bob", fo.value.string),
-    }
+    try testing.expectEqualStrings("alice", txn.range_set.items[0].find_one.value.string);
+    try testing.expectEqualStrings("bob", txn.range_set.items[1].find_one.value.string);
     txn.abort();
+}
+
+test "OptimisticTxn: findRange phantom — concurrent insert into observed range conflicts" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-fr-phantom.db");
+    defer db.close();
+
+    // Seed three docs with counts 10, 20, 30. Index on count.
+    const a = try buildDoc("a", 10);
+    defer ally.free(a);
+    const b = try buildDoc("b", 20);
+    defer ally.free(b);
+    const c = try buildDoc("c", 30);
+    defer ally.free(c);
+    _ = try db.collection("u").insert(a);
+    _ = try db.collection("u").insert(b);
+    _ = try db.collection("u").insert(c);
+    try db.createIndex("u", "count");
+    try db.checkpoint();
+
+    // Txn reads the [15, 25] range — sees only b.
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    var it = try txn.collection("u").findRange(
+        ally,
+        "count",
+        .{ .inclusive = .{ .i64 = 15 } },
+        .{ .inclusive = .{ .i64 = 25 } },
+    );
+    defer it.deinit();
+    var n: u32 = 0;
+    while (try it.next()) |_| n += 1;
+    try testing.expectEqual(@as(u32, 1), n);
+
+    // Concurrent committer drops a doc with count=20 (clone of b) into
+    // the observed range.
+    const d = try buildDoc("d", 20);
+    defer ally.free(d);
+    _ = try db.collection("u").insert(d);
+
+    try testing.expectError(Error.WriteConflict, txn.commit());
+}
+
+test "OptimisticTxn: findRange — disjoint range query is unaffected by writes outside it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-fr-disjoint.db");
+    defer db.close();
+
+    const a = try buildDoc("a", 10);
+    defer ally.free(a);
+    const b = try buildDoc("b", 20);
+    defer ally.free(b);
+    _ = try db.collection("u").insert(a);
+    _ = try db.collection("u").insert(b);
+    try db.createIndex("u", "count");
+    try db.checkpoint();
+
+    // Txn reads [15, 25] — sees b.
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    var it = try txn.collection("u").findRange(
+        ally,
+        "count",
+        .{ .inclusive = .{ .i64 = 15 } },
+        .{ .inclusive = .{ .i64 = 25 } },
+    );
+    defer it.deinit();
+    while (try it.next()) |_| {}
+
+    // Concurrent insert with count=100 — out of range, no conflict.
+    const c = try buildDoc("c", 100);
+    defer ally.free(c);
+    _ = try db.collection("u").insert(c);
+
+    try txn.commit();
+}
+
+test "OptimisticTxn: findAll phantom — concurrent insert with same value conflicts" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-fa-phantom.db");
+    defer db.close();
+
+    const alice = try buildDoc("alice", 1);
+    defer ally.free(alice);
+    _ = try db.collection("u").insert(alice);
+    try db.createIndex("u", "name");
+    try db.checkpoint();
+
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    var it = try txn.collection("u").findAll(ally, "name", .{ .string = "alice" });
+    defer it.deinit();
+    var seen: u32 = 0;
+    while (try it.next()) |_| seen += 1;
+    try testing.expectEqual(@as(u32, 1), seen);
+
+    // Concurrent committer adds another alice.
+    const a2 = try buildDoc("alice", 2);
+    defer ally.free(a2);
+    _ = try db.collection("u").insert(a2);
+
+    try testing.expectError(Error.WriteConflict, txn.commit());
 }
