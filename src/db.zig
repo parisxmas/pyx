@@ -250,6 +250,7 @@ pub const Db = struct {
             .arena = std.heap.ArenaAllocator.init(self.allocator),
             .read_set = .empty,
             .write_set = .empty,
+            .range_set = .empty,
         };
     }
 
@@ -835,11 +836,10 @@ pub const FindIterator = struct {
 /// `write_set` and applied to the live B+Tree only at commit, after
 /// validation succeeds.
 ///
-/// Read tracking is point-only in this version — `findOne` /
-/// `findAll` / `findRange` / `iterator` delegate to the snapshot
-/// without recording, so range-style reads inside a txn are
-/// phantom-prone (a concurrent committer can insert into the range
-/// without conflict). Range tracking lands in a later version.
+/// Read tracking covers point reads (via `read_set`) and indexed
+/// equality / range reads (via `range_set`). `Collection.iterator`
+/// (full-collection scans) is not yet tracked — phantoms there are
+/// O(collection) to validate, so they're left as a documented gap.
 pub const OptimisticTxn = struct {
     db: *Db,
     snapshot: Snapshot,
@@ -847,6 +847,7 @@ pub const OptimisticTxn = struct {
     arena: std.heap.ArenaAllocator,
     read_set: ArrayList(ReadSetEntry),
     write_set: ArrayList(WriteSetEntry),
+    range_set: ArrayList(RangeReadEntry),
     done: bool = false,
 
     pub const WriteKind = enum { insert, put, delete };
@@ -857,6 +858,22 @@ pub const OptimisticTxn = struct {
         /// Wyhash of the doc bytes at read time, or 0 sentinel when the
         /// read returned null.
         value_hash: u64,
+    };
+
+    /// Indexed read predicate captured at read time. At commit, the
+    /// validator re-runs the same predicate against the live tree and
+    /// compares the result to what was observed; any difference =
+    /// phantom = `WriteConflict`.
+    pub const RangeReadEntry = union(enum) {
+        find_one: FindOneEntry,
+        // find_range / find_all land in phase 2.
+    };
+
+    pub const FindOneEntry = struct {
+        coll: []const u8,           // owned by `arena`
+        field: []const u8,          // owned by `arena`
+        value: doc_mod.Value,       // string/bytes payloads owned by `arena`
+        first_match: ?u64,          // result observed at snapshot time
     };
 
     pub const WriteSetEntry = struct {
@@ -902,6 +919,15 @@ pub const OptimisticTxn = struct {
             if (live_hash != entry.value_hash) return Error.WriteConflict;
         }
 
+        for (self.range_set.items) |entry| {
+            switch (entry) {
+                .find_one => |fo| {
+                    const live_first = try self.db.collection(fo.coll).findOne(fo.field, fo.value);
+                    if (live_first != fo.first_match) return Error.WriteConflict;
+                },
+            }
+        }
+
         for (self.write_set.items) |entry| {
             const coll = self.db.collection(entry.coll);
             switch (entry.kind) {
@@ -922,6 +948,7 @@ pub const OptimisticTxn = struct {
         self.done = true;
         self.read_set.deinit(self.db.allocator);
         self.write_set.deinit(self.db.allocator);
+        self.range_set.deinit(self.db.allocator);
         self.arena.deinit();
         self.snapshot.deinit();
     }
@@ -976,7 +1003,37 @@ pub const OptimisticTxn = struct {
             .value = owned_value,
         });
     }
+
+    fn recordFindOne(
+        self: *OptimisticTxn,
+        coll: []const u8,
+        field: []const u8,
+        value: doc_mod.Value,
+        first_match: ?u64,
+    ) !void {
+        const arena_allocator = self.arena.allocator();
+        try self.range_set.append(self.db.allocator, .{
+            .find_one = .{
+                .coll = try arena_allocator.dupe(u8, coll),
+                .field = try arena_allocator.dupe(u8, field),
+                .value = try dupeValue(arena_allocator, value),
+                .first_match = first_match,
+            },
+        });
+    }
 };
+
+/// Deep-copy a doc_mod.Value into the given allocator. The variants
+/// that carry slice payloads (`string`, `bytes`) are duped; inline
+/// variants pass through. Array/object values aren't yet allowed in
+/// indexed lookups, so they're treated as pass-through too.
+fn dupeValue(arena: Allocator, v: doc_mod.Value) !doc_mod.Value {
+    return switch (v) {
+        .string => |s| .{ .string = try arena.dupe(u8, s) },
+        .bytes => |b| .{ .bytes = try arena.dupe(u8, b) },
+        else => v,
+    };
+}
 
 /// Collection handle bound to an `OptimisticTxn`. Reads go through the
 /// txn's snapshot (lock-free); writes are buffered in the txn until
@@ -1073,7 +1130,9 @@ pub const TxnCollection = struct {
         value: doc_mod.Value,
     ) !?u64 {
         try validateName(self.name);
-        return self.txn.snapshot.collection(self.name).findOne(field_path, value);
+        const first = try self.txn.snapshot.collection(self.name).findOne(field_path, value);
+        try self.txn.recordFindOne(self.name, field_path, value, first);
+        return first;
     }
 
     pub fn findAll(
@@ -2133,4 +2192,103 @@ test "OptimisticTxn: concurrent disjoint blind puts both succeed" {
     defer ally.free(got_b);
     try testing.expectEqualSlices(u8, v_a, got_a);
     try testing.expectEqualSlices(u8, v_b, got_b);
+}
+
+test "OptimisticTxn: findOne phantom — concurrent insert with smaller doc_id triggers conflict" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-fo-phantom.db");
+    defer db.close();
+
+    // Seed two existing alices, then drop the lower-id one so the
+    // index has a gap below the surviving match.
+    const alice_a = try buildDoc("alice", 100);
+    defer ally.free(alice_a);
+    const alice_b = try buildDoc("alice", 200);
+    defer ally.free(alice_b);
+
+    const id_low = try db.collection("u").insert(alice_a);
+    const id_high = try db.collection("u").insert(alice_b);
+    _ = try db.collection("u").delete(id_low);
+    try db.createIndex("u", "name");
+    try db.checkpoint();
+
+    // Txn A reads "alice" and sees id_high as the first match.
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    const got = try txn.collection("u").findOne("name", .{ .string = "alice" });
+    try testing.expectEqual(@as(?u64, id_high), got);
+
+    // Concurrent committer inserts a new "alice" — it gets a fresh
+    // doc_id from the atomic counter, which is now ABOVE id_high; so
+    // findOne's first match is unchanged. NO conflict expected.
+    const alice_c = try buildDoc("alice", 300);
+    defer ally.free(alice_c);
+    const id_higher = try db.collection("u").insert(alice_c);
+    try testing.expect(id_higher > id_high);
+    try txn.commit();
+
+    // Now reverse: a phantom that DOES change first_match. Re-seed.
+    const bob = try buildDoc("bob", 1);
+    defer ally.free(bob);
+    const id_first_bob = try db.collection("u").insert(bob);
+    try db.checkpoint();
+
+    var txn2 = try db.beginOptimistic();
+    errdefer txn2.abort();
+    const got2 = try txn2.collection("u").findOne("name", .{ .string = "bob" });
+    try testing.expectEqual(@as(?u64, id_first_bob), got2);
+
+    // External committer deletes the only match — first_match becomes null.
+    _ = try db.collection("u").delete(id_first_bob);
+    try testing.expectError(Error.WriteConflict, txn2.commit());
+}
+
+test "OptimisticTxn: findOne(null result) detects phantom insert into the predicate" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-fo-empty.db");
+    defer db.close();
+
+    try db.createIndex("u", "name");
+
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    // Predicate has zero matches at start_root.
+    const got = try txn.collection("u").findOne("name", .{ .string = "carol" });
+    try testing.expectEqual(@as(?u64, null), got);
+
+    // Concurrent inserter creates a "carol" — predicate now has a match.
+    const carol = try buildDoc("carol", 1);
+    defer ally.free(carol);
+    _ = try db.collection("u").insert(carol);
+
+    // Validation re-runs findOne, sees a match where there was none → conflict.
+    try testing.expectError(Error.WriteConflict, txn.commit());
+}
+
+test "OptimisticTxn: range_set entry recorded for each findOne call" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-fo-record.db");
+    defer db.close();
+
+    try db.createIndex("u", "name");
+
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    _ = try txn.collection("u").findOne("name", .{ .string = "alice" });
+    _ = try txn.collection("u").findOne("name", .{ .string = "bob" });
+
+    try testing.expectEqual(@as(usize, 2), txn.range_set.items.len);
+    switch (txn.range_set.items[0]) {
+        .find_one => |fo| try testing.expectEqualStrings("alice", fo.value.string),
+    }
+    switch (txn.range_set.items[1]) {
+        .find_one => |fo| try testing.expectEqualStrings("bob", fo.value.string),
+    }
+    txn.abort();
 }
