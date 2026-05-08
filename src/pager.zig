@@ -189,16 +189,24 @@ pub const Pager = struct {
         const shm_path = try mem.concat(allocator, u8, &.{ sub_path, "-shm" });
         defer allocator.free(shm_path);
 
-        // Take RECOVERY EXCL (blocking) for the duration of open. This
-        // serialises every opener system-wide so the fresh-init path
+        // Take WRITER (byte 0) blocking for the entire open path.
+        // This serialises every opener system-wide so the fresh-init
         // (writing the header, deleting stale wal/shm) runs at most
-        // once even when N processes start simultaneously. Once we
-        // finish open we downgrade to SHARED for the lifetime of the
-        // handle.
-        try flock_mod.lock(file.handle, .write, recovery_lock_region);
-        // The downgrade at end of open will release the EXCL hold; if
-        // we error out before then, drop EXCL on close.
-        errdefer flock_mod.unlock(file.handle, recovery_lock_region) catch {};
+        // once even when N processes start simultaneously, AND so
+        // shm seeding can't race a concurrent committer. Released at
+        // the end of open; subsequent commits take it again.
+        //
+        // We deliberately don't keep a SHARED-for-lifetime byte: that
+        // pattern (used by SQLite) needs a second lock byte to avoid
+        // self-deadlock between "I'm a long-running connection" and
+        // "I want to open right now". With the simpler "open under
+        // WRITER, release on success" protocol, openers just queue
+        // briefly behind any in-flight committer.
+        try flock_mod.lock(file.handle, .write, writer_lock_region);
+        var open_writer_held = true;
+        errdefer if (open_writer_held) {
+            flock_mod.unlock(file.handle, writer_lock_region) catch {};
+        };
 
         const file_len = try file.length(io);
         const fresh = file_len == 0;
@@ -243,10 +251,10 @@ pub const Pager = struct {
         var wal = try wal_mod.Wal.open(allocator, io, dir, wal_path, shm.walEndOffset());
         errdefer wal.close();
 
-        // Downgrade RECOVERY EXCL → SHARED for the lifetime of this
-        // handle. Other openers can now proceed (and also take
-        // SHARED). Closing the file fd later will release the lock.
-        flock_mod.lock(file.handle, .read, recovery_lock_region) catch {};
+        // Open complete. Release the WRITER lock so other processes
+        // (whether opening or committing) can proceed.
+        flock_mod.unlock(file.handle, writer_lock_region) catch {};
+        open_writer_held = false;
 
         return .{
             .allocator = allocator,

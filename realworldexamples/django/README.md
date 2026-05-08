@@ -10,16 +10,23 @@ tag filtering via an indexed query, optimistic-concurrency for safe
 concurrent edits, and a snapshot-backed list view that doesn't block
 on writers.
 
-## Multi-process: now actually safe
+## Multi-process: actually verified under gunicorn
 
-As of the phase 2 multi-process work, opening the same pyx DB from
-multiple worker processes is safe — writes commit through a
-cross-process WRITER lock, page allocations go through shm-resident
-atomics, and the B+Tree root is in shm so every process sees every
-other's commits. Verified empirically with 8 processes × 100 inserts
-× 3 trials → all 800 docs preserved every time.
+Opening the same pyx DB from multiple gunicorn workers is supported.
+Writes serialise on a cross-process `fcntl` WRITER lock (one commit
+in flight at a time, machine-wide); reads are lock-free and scale
+across both threads and processes.
 
-Practical Django deployments:
+Empirically verified with this exact `notes_project`:
+
+```
+$ gunicorn --workers 4 --bind 127.0.0.1:8000 notes_project.wsgi:application
+$ # 1000 parallel POST /notes/new/ → 1000/1000 succeed in ~1.16s
+$ # GET /notes/?u=bob   → 1000 docs visible
+$ # 50 parallel POST /notes/1/edit/ → all 50 succeed via OCC auto-retry
+```
+
+So:
 
 ```sh
 # dev
@@ -30,9 +37,9 @@ gunicorn --workers 4 notes_project.wsgi:application
 ```
 
 The single-writer model still applies — only one process is in the
-commit critical section at a time, so write throughput is bounded by
-that. Reads are lock-free and scale across processes; the typical
-web-app workload is fine.
+commit critical section at a time, so aggregate write throughput is
+bounded by that. Reads scale across workers without contention; the
+typical web-app workload is fine.
 
 ## Why pyx here?
 

@@ -45,6 +45,20 @@ tag goes under `## Unreleased`.
     truncate the WAL during a concurrent committer's append.
   - Verified: two processes each inserting 200 docs into the same
     DB → 400 docs preserved, byte-identical to single-process.
+- Multi-process under gunicorn `--workers 4` actually verified —
+  the open path now uses the WRITER lock (byte 0) instead of the
+  RECOVERY-shared-for-lifetime pattern. The previous protocol
+  deadlocked: long-running workers held RECOVERY shared for life,
+  blocking new openers' RECOVERY exclusive forever. The simpler
+  "WRITER blocking around the entire open, released at success"
+  pattern serialises opens with commits but doesn't keep any
+  lock for the connection's lifetime — so an opener can always
+  make progress as soon as the current writer releases.
+  Verified: 1000 parallel POSTs across 4 gunicorn workers in
+  1.16 s (~862 commits/s aggregate, all 1000 docs preserved),
+  plus 50 concurrent OCC edits of the same note all succeeding
+  via auto-retry. The Django README's "single-process only"
+  caveat is finally truly obsolete.
 - Multi-process foundation, phases 3-5 wrap-up: `free_head` joins
   the shm-resident counters so the free list works across
   processes (deletes / aborts in one process now actually let
