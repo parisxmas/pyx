@@ -44,6 +44,17 @@ class UnsupportedFieldType(PyxError):
     pass
 
 
+class WriteConflict(PyxError):
+    """Raised by `OptimisticTxn.commit` when validation detects a
+    concurrent change to a key in this txn's read set. Caller should
+    retry — `Db.run_optimistic` does this automatically."""
+
+
+class RetryBudgetExhausted(PyxError):
+    """Raised by `Db.run_optimistic` when `max_attempts` is reached
+    without a successful commit."""
+
+
 def from_status(status: int, message: str = "") -> PyxError:
     """Construct a typed PyxError for a status code."""
     cls = _STATUS_TO_CLASS.get(status, PyxError)
@@ -59,4 +70,6 @@ _STATUS_TO_CLASS = {
     -9: CollectionNameInvalid,
     -10: NoSuchIndex,
     -11: UnsupportedFieldType,
+    -12: WriteConflict,
+    -13: RetryBudgetExhausted,
 }

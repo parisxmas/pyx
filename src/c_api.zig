@@ -34,6 +34,8 @@ const Status = enum(c_int) {
     collection_name_invalid = -9,
     no_such_index = -10,
     unsupported_field_type = -11,
+    write_conflict = -12,
+    retry_budget_exhausted = -13,
     internal = -99,
 };
 
@@ -60,6 +62,8 @@ fn statusFromError(err: anyerror) c_int {
         error.CollectionNameInvalid => .collection_name_invalid,
         error.NoSuchIndex => .no_such_index,
         error.UnsupportedFieldType => .unsupported_field_type,
+        error.WriteConflict => .write_conflict,
+        error.RetryBudgetExhausted => .retry_budget_exhausted,
         else => blk: {
             setLastError("internal error: {t}", .{err});
             break :blk .internal;
@@ -73,6 +77,7 @@ const status_not_found: c_int = @intFromEnum(Status.not_found);
 const status_end: c_int = @intFromEnum(Status.end);
 const status_invalid_arg: c_int = @intFromEnum(Status.invalid_arg);
 const status_oom: c_int = @intFromEnum(Status.out_of_memory);
+const status_write_conflict: c_int = @intFromEnum(Status.write_conflict);
 
 // ====================================================================
 // Per-thread last-error buffer.
@@ -128,6 +133,8 @@ export fn pyx_status_string(status: c_int) [*:0]const u8 {
         @intFromEnum(Status.collection_name_invalid) => "collection name invalid",
         @intFromEnum(Status.no_such_index) => "no such index",
         @intFromEnum(Status.unsupported_field_type) => "unsupported field type",
+        @intFromEnum(Status.write_conflict) => "OCC write conflict — retry",
+        @intFromEnum(Status.retry_budget_exhausted) => "OCC retry budget exhausted",
         @intFromEnum(Status.internal) => "internal error",
         else => "unknown status",
     };
@@ -163,6 +170,14 @@ const LookupState = struct {
         equality: index_mod.LookupIterator,
         range: index_mod.RangeIterator,
     },
+};
+
+const OptimisticTxnState = struct {
+    allocator: Allocator,
+    txn: pyx.db.OptimisticTxn,
+    /// Borrowed; gives the OCC C entry points access to the underlying
+    /// state if they ever need it (currently they only touch `txn`).
+    state: *State,
 };
 
 // ====================================================================
@@ -716,6 +731,141 @@ export fn pyx_snapshot_find_range(
 }
 
 // ====================================================================
+// Optimistic concurrency
+// ====================================================================
+
+export fn pyx_begin_optimistic(db: ?*State, out_txn: ?**OptimisticTxnState) c_int {
+    const s = db orelse return status_invalid_arg;
+    const out = out_txn orelse return status_invalid_arg;
+    const ts = s.allocator.create(OptimisticTxnState) catch {
+        setLastError("pyx_begin_optimistic: out of memory", .{});
+        return status_oom;
+    };
+    ts.allocator = s.allocator;
+    ts.state = s;
+    ts.txn = s.db.beginOptimistic() catch |err| {
+        s.allocator.destroy(ts);
+        setLastError("pyx_begin_optimistic: {t}", .{err});
+        return statusFromError(err);
+    };
+    out.* = ts;
+    return status_ok;
+}
+
+export fn pyx_optimistic_commit(txn: ?*OptimisticTxnState) c_int {
+    const t = txn orelse return status_invalid_arg;
+    defer t.allocator.destroy(t);
+    t.txn.commit() catch |err| {
+        // pyx.db.OptimisticTxn.commit deinits its own state on every
+        // path, so we don't call abort here on error.
+        if (err != error.WriteConflict) setLastError("pyx_optimistic_commit: {t}", .{err});
+        return statusFromError(err);
+    };
+    return status_ok;
+}
+
+export fn pyx_optimistic_abort(txn: ?*OptimisticTxnState) void {
+    const t = txn orelse return;
+    t.txn.abort();
+    t.allocator.destroy(t);
+}
+
+export fn pyx_optimistic_insert(
+    txn: ?*OptimisticTxnState,
+    coll: ?[*]const u8, coll_len: usize,
+    doc: ?[*]const u8, doc_len: usize,
+    out_doc_id: ?*u64,
+) c_int {
+    const t = txn orelse return status_invalid_arg;
+    const c = nameSliceFromCArg(coll, coll_len) orelse return status_invalid_arg;
+    const d = sliceFromCArg(doc, doc_len) orelse return status_invalid_arg;
+    const out = out_doc_id orelse return status_invalid_arg;
+    const id = t.txn.collection(c).insert(d) catch |err| {
+        setLastError("pyx_optimistic_insert: {t}", .{err});
+        return statusFromError(err);
+    };
+    out.* = id;
+    return status_ok;
+}
+
+export fn pyx_optimistic_put(
+    txn: ?*OptimisticTxnState,
+    coll: ?[*]const u8, coll_len: usize,
+    doc_id: u64,
+    doc: ?[*]const u8, doc_len: usize,
+) c_int {
+    const t = txn orelse return status_invalid_arg;
+    const c = nameSliceFromCArg(coll, coll_len) orelse return status_invalid_arg;
+    const d = sliceFromCArg(doc, doc_len) orelse return status_invalid_arg;
+    t.txn.collection(c).put(doc_id, d) catch |err| {
+        setLastError("pyx_optimistic_put: {t}", .{err});
+        return statusFromError(err);
+    };
+    return status_ok;
+}
+
+export fn pyx_optimistic_delete(
+    txn: ?*OptimisticTxnState,
+    coll: ?[*]const u8, coll_len: usize,
+    doc_id: u64,
+) c_int {
+    const t = txn orelse return status_invalid_arg;
+    const c = nameSliceFromCArg(coll, coll_len) orelse return status_invalid_arg;
+    _ = t.txn.collection(c).delete(doc_id) catch |err| {
+        setLastError("pyx_optimistic_delete: {t}", .{err});
+        return statusFromError(err);
+    };
+    return status_ok;
+}
+
+export fn pyx_optimistic_get(
+    txn: ?*OptimisticTxnState,
+    coll: ?[*]const u8, coll_len: usize,
+    doc_id: u64,
+    out: ?*PyxBuf,
+) c_int {
+    const t = txn orelse return status_invalid_arg;
+    const c = nameSliceFromCArg(coll, coll_len) orelse return status_invalid_arg;
+    const buf = out orelse return status_invalid_arg;
+    const result = t.txn.collection(c).get(std.heap.c_allocator, doc_id) catch |err| {
+        setLastError("pyx_optimistic_get: {t}", .{err});
+        return statusFromError(err);
+    };
+    if (result) |bytes| {
+        buf.data = bytes.ptr;
+        buf.len = bytes.len;
+        return status_ok;
+    }
+    buf.data = null;
+    buf.len = 0;
+    return status_not_found;
+}
+
+export fn pyx_optimistic_find_one(
+    txn: ?*OptimisticTxnState,
+    coll: ?[*]const u8, coll_len: usize,
+    field: ?[*]const u8, field_len: usize,
+    value: ?*const PyxValue,
+    out_doc_id: ?*u64,
+) c_int {
+    const t = txn orelse return status_invalid_arg;
+    const c = nameSliceFromCArg(coll, coll_len) orelse return status_invalid_arg;
+    const f = nameSliceFromCArg(field, field_len) orelse return status_invalid_arg;
+    const v = value orelse return status_invalid_arg;
+    const out = out_doc_id orelse return status_invalid_arg;
+    const dv = convertValue(v) catch return status_invalid_arg;
+    const id = t.txn.collection(c).findOne(f, dv) catch |err| {
+        setLastError("pyx_optimistic_find_one: {t}", .{err});
+        return statusFromError(err);
+    };
+    if (id) |found| {
+        out.* = found;
+        return status_ok;
+    }
+    return status_not_found;
+}
+
+// ====================================================================
 // Round-trip self-test (calls our own exports through Zig).
 // ====================================================================
 
@@ -862,4 +1012,83 @@ test "C ABI: null inputs return invalid_arg, not crash" {
     pyx_close(null); // no-op
     pyx_buf_free(null); // no-op
     try testing.expectEqual(status_invalid_arg, pyx_checkpoint(null));
+}
+
+test "C ABI: OCC begin/insert/get/commit roundtrip" {
+    const path = cabiPath("c-abi-occ.db");
+    var db: *State = undefined;
+    try testing.expectEqual(status_ok, pyx_open(path.ptr, &db));
+    defer pyx_close(db);
+    pyx_set_sync_mode(db, 1);
+
+    var txn: *OptimisticTxnState = undefined;
+    try testing.expectEqual(status_ok, pyx_begin_optimistic(db, &txn));
+
+    const coll = "users";
+    var doc1 = "{\"name\": \"alice\"}".*;
+    var id1: u64 = 0;
+    try testing.expectEqual(status_ok, pyx_optimistic_insert(txn, coll.ptr, coll.len, &doc1, doc1.len, &id1));
+    try testing.expect(id1 > 0);
+
+    // Read-your-own-writes via the OCC get path.
+    var got: PyxBuf = .{ .data = null, .len = 0 };
+    try testing.expectEqual(status_ok, pyx_optimistic_get(txn, coll.ptr, coll.len, id1, &got));
+    try testing.expectEqualSlices(u8, &doc1, got.data.?[0..got.len]);
+    pyx_buf_free(&got);
+
+    try testing.expectEqual(status_ok, pyx_optimistic_commit(txn));
+
+    // After commit, the doc must be visible via the regular get.
+    try testing.expectEqual(status_ok, pyx_get(db, coll.ptr, coll.len, id1, &got));
+    try testing.expectEqualSlices(u8, &doc1, got.data.?[0..got.len]);
+    pyx_buf_free(&got);
+}
+
+test "C ABI: OCC abort discards writes" {
+    const path = cabiPath("c-abi-occ-abort.db");
+    var db: *State = undefined;
+    try testing.expectEqual(status_ok, pyx_open(path.ptr, &db));
+    defer pyx_close(db);
+    pyx_set_sync_mode(db, 1);
+
+    var txn: *OptimisticTxnState = undefined;
+    try testing.expectEqual(status_ok, pyx_begin_optimistic(db, &txn));
+    const coll = "c";
+    var doc1 = "{\"x\": 1}".*;
+    var id1: u64 = 0;
+    try testing.expectEqual(status_ok, pyx_optimistic_insert(txn, coll.ptr, coll.len, &doc1, doc1.len, &id1));
+    pyx_optimistic_abort(txn);
+
+    var got: PyxBuf = .{ .data = null, .len = 0 };
+    try testing.expectEqual(status_not_found, pyx_get(db, coll.ptr, coll.len, id1, &got));
+}
+
+test "C ABI: OCC commit returns write_conflict on observed-value change" {
+    const path = cabiPath("c-abi-occ-conflict.db");
+    var db: *State = undefined;
+    try testing.expectEqual(status_ok, pyx_open(path.ptr, &db));
+    defer pyx_close(db);
+    pyx_set_sync_mode(db, 1);
+
+    const coll = "c";
+    var v0 = "{\"v\": 0}".*;
+    var v1 = "{\"v\": 1}".*;
+    var v2 = "{\"v\": 2}".*;
+    var id: u64 = 0;
+    try testing.expectEqual(status_ok, pyx_insert(db, coll.ptr, coll.len, &v0, v0.len, &id));
+    try testing.expectEqual(status_ok, pyx_checkpoint(db));
+
+    // Begin an OCC txn and read the doc.
+    var txn: *OptimisticTxnState = undefined;
+    try testing.expectEqual(status_ok, pyx_begin_optimistic(db, &txn));
+    var got: PyxBuf = .{ .data = null, .len = 0 };
+    try testing.expectEqual(status_ok, pyx_optimistic_get(txn, coll.ptr, coll.len, id, &got));
+    pyx_buf_free(&got);
+
+    // External committer overwrites it.
+    try testing.expectEqual(status_ok, pyx_put(db, coll.ptr, coll.len, id, &v1, v1.len));
+
+    // OCC stages its own write and tries to commit → conflict.
+    try testing.expectEqual(status_ok, pyx_optimistic_put(txn, coll.ptr, coll.len, id, &v2, v2.len));
+    try testing.expectEqual(status_write_conflict, pyx_optimistic_commit(txn));
 }

@@ -227,3 +227,147 @@ class TestErrors:
         with pytest.raises(pyx.PyxError) as exc:
             users.find_one("age", 30)
         assert exc.value.status == -10  # PYX_NO_SUCH_INDEX
+
+
+class TestOptimisticTxn:
+    def test_insert_get_commit(self, db):
+        with db.begin_optimistic() as txn:
+            users = txn.collection("users")
+            uid = users.insert({"name": "alice", "age": 30})
+            # Read-your-own-writes inside the txn.
+            assert users.get(uid) == {"name": "alice", "age": 30}
+            txn.commit()
+        # Visible after commit via the regular API.
+        assert db.collection("users").get(uid) == {"name": "alice", "age": 30}
+
+    def test_abort_discards(self, db):
+        txn = db.begin_optimistic()
+        users = txn.collection("users")
+        uid = users.insert({"name": "bob"})
+        txn.abort()
+        assert db.collection("users").get(uid) is None
+
+    def test_write_conflict_raised(self, db):
+        users = db.collection("users")
+        seed_id = users.insert({"v": 0})
+        db.checkpoint()
+
+        txn = db.begin_optimistic()
+        tc = txn.collection("users")
+        # Read so we record into read_set.
+        assert tc.get(seed_id) == {"v": 0}
+        # External committer changes the doc.
+        users.put(seed_id, {"v": 1})
+        # OCC commit detects the change and raises.
+        tc.put(seed_id, {"v": 2})
+        with pytest.raises(pyx.WriteConflict):
+            txn.commit()
+
+    def test_run_optimistic_retries_until_success(self, db):
+        users = db.collection("users")
+        seed_id = users.insert({"counter": 0})
+        db.checkpoint()
+
+        # On attempts 1-2, force conflict; attempt 3 succeeds.
+        attempts = {"n": 0}
+
+        def fn(txn):
+            attempts["n"] += 1
+            tc = txn.collection("users")
+            cur = tc.get(seed_id)
+            if attempts["n"] <= 2:
+                # Mutate the live doc through the regular API → next
+                # commit will see a divergent read_set entry.
+                users.put(seed_id, {"counter": attempts["n"]})
+            tc.put(seed_id, {"counter": (cur["counter"] + 100)})
+
+        db.run_optimistic(fn, max_attempts=8)
+        assert attempts["n"] == 3
+        # Whatever we wrote in attempt 3 won.
+        assert "counter" in db.collection("users").get(seed_id)
+
+    def test_run_optimistic_budget_exhausted(self, db):
+        users = db.collection("users")
+        seed_id = users.insert({"v": 0})
+        db.checkpoint()
+
+        counter = {"n": 0}
+
+        def fn(txn):
+            tc = txn.collection("users")
+            tc.get(seed_id)
+            # Always mutate the live doc to a NEW value so every retry's
+            # read_set diverges and conflicts again — not the same value
+            # twice (which would hash-equal and pass validation).
+            counter["n"] += 1
+            users.put(seed_id, {"v": counter["n"]})
+            tc.put(seed_id, {"v": 999})
+
+        with pytest.raises(pyx.RetryBudgetExhausted):
+            db.run_optimistic(fn, max_attempts=3)
+
+    def test_find_one_inside_txn(self, db):
+        users = db.collection("users")
+        users.insert({"name": "alice", "age": 30})
+        users.insert({"name": "bob", "age": 25})
+        db.create_index("users", "name")
+        db.checkpoint()
+
+        with db.begin_optimistic() as txn:
+            tc = txn.collection("users")
+            got = tc.find_one("name", "alice")
+            assert got is not None
+            txn.commit()
+
+
+class TestFindRangeErgonomics:
+    """find_range now accepts bare scalars (inclusive shorthand) and
+    SQL-style kwargs in addition to the explicit Bound API."""
+
+    def test_bare_scalars_are_inclusive(self, db):
+        users = db.collection("users")
+        for i in range(10):
+            users.insert({"age": i})
+        db.create_index("users", "age")
+        # Closed [3, 6] — should yield 4 values.
+        ids = list(users.find_range("age", 3, 6))
+        assert len(ids) == 4
+
+    def test_bare_scalars_mixed_with_bound(self, db):
+        users = db.collection("users")
+        for i in range(10):
+            users.insert({"age": i})
+        db.create_index("users", "age")
+        # 3 < age <= 6 — should yield 3 values (4, 5, 6).
+        ids = list(users.find_range("age", pyx.Bound.exclusive(3), 6))
+        assert len(ids) == 3
+
+    def test_kwargs_gte_lt(self, db):
+        users = db.collection("users")
+        for i in range(10):
+            users.insert({"age": i})
+        db.create_index("users", "age")
+        ids = list(users.find_range("age", gte=3, lt=6))
+        assert len(ids) == 3  # 3, 4, 5
+
+    def test_kwargs_unbounded(self, db):
+        users = db.collection("users")
+        for i in range(10):
+            users.insert({"age": i})
+        db.create_index("users", "age")
+        ids = list(users.find_range("age", gte=7))
+        assert len(ids) == 3  # 7, 8, 9
+
+    def test_kwargs_mixed_positional_rejected(self, db):
+        users = db.collection("users")
+        users.insert({"age": 1})
+        db.create_index("users", "age")
+        with pytest.raises(TypeError):
+            list(users.find_range("age", 1, gte=5))
+
+    def test_kwargs_both_lower_bounds_rejected(self, db):
+        users = db.collection("users")
+        users.insert({"age": 1})
+        db.create_index("users", "age")
+        with pytest.raises(TypeError):
+            list(users.find_range("age", gte=1, gt=2))

@@ -103,6 +103,8 @@ PYX_VALUE_TOO_LARGE = -8
 PYX_COLLECTION_NAME_INVALID = -9
 PYX_NO_SUCH_INDEX = -10
 PYX_UNSUPPORTED_FIELD_TYPE = -11
+PYX_WRITE_CONFLICT = -12
+PYX_RETRY_BUDGET_EXHAUSTED = -13
 PYX_INTERNAL = -99
 
 # Value type tags.
@@ -249,4 +251,42 @@ pyx_snapshot_find_range = _bind(
     C.c_void_p, C.c_char_p, C.c_size_t, C.c_char_p, C.c_size_t,
     C.POINTER(PyxBound), C.POINTER(PyxBound),
     C.POINTER(C.c_void_p),
+)
+
+# Optimistic concurrency
+pyx_begin_optimistic = _bind(
+    "pyx_begin_optimistic", C.c_int, C.c_void_p, C.POINTER(C.c_void_p)
+)
+pyx_optimistic_commit = _bind("pyx_optimistic_commit", C.c_int, C.c_void_p)
+pyx_optimistic_abort = _bind("pyx_optimistic_abort", None, C.c_void_p)
+pyx_optimistic_insert = _bind(
+    "pyx_optimistic_insert",
+    C.c_int,
+    C.c_void_p, C.c_char_p, C.c_size_t,
+    C.POINTER(C.c_uint8), C.c_size_t,
+    C.POINTER(C.c_uint64),
+)
+pyx_optimistic_put = _bind(
+    "pyx_optimistic_put",
+    C.c_int,
+    C.c_void_p, C.c_char_p, C.c_size_t,
+    C.c_uint64,
+    C.POINTER(C.c_uint8), C.c_size_t,
+)
+pyx_optimistic_delete = _bind(
+    "pyx_optimistic_delete",
+    C.c_int,
+    C.c_void_p, C.c_char_p, C.c_size_t, C.c_uint64,
+)
+pyx_optimistic_get = _bind(
+    "pyx_optimistic_get",
+    C.c_int,
+    C.c_void_p, C.c_char_p, C.c_size_t, C.c_uint64,
+    C.POINTER(PyxBuf),
+)
+pyx_optimistic_find_one = _bind(
+    "pyx_optimistic_find_one",
+    C.c_int,
+    C.c_void_p, C.c_char_p, C.c_size_t, C.c_char_p, C.c_size_t,
+    C.POINTER(PyxValue), C.POINTER(C.c_uint64),
 )

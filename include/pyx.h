@@ -75,6 +75,8 @@ typedef enum pyx_status {
     PYX_COLLECTION_NAME_INVALID = -9,
     PYX_NO_SUCH_INDEX = -10,
     PYX_UNSUPPORTED_FIELD_TYPE = -11,
+    PYX_WRITE_CONFLICT = -12,            /* OCC: retry the txn */
+    PYX_RETRY_BUDGET_EXHAUSTED = -13,    /* OCC: gave up after max attempts */
     PYX_INTERNAL = -99,
 } pyx_status;
 
@@ -93,6 +95,7 @@ typedef struct pyx_db        pyx_db;
 typedef struct pyx_snapshot  pyx_snapshot;
 typedef struct pyx_iter      pyx_iter;
 typedef struct pyx_lookup    pyx_lookup;
+typedef struct pyx_optimistic_txn pyx_optimistic_txn;
 
 /* Owned-byte output. pyx allocates `data`; caller releases via pyx_buf_free.
  * `data` is NULL when `len == 0`. */
@@ -327,6 +330,78 @@ pyx_status pyx_snapshot_find_range(
     const pyx_bound *lo,
     const pyx_bound *hi,
     pyx_lookup **out_lookup);
+
+/* ===================================================================== */
+/*  Optimistic-concurrency transactions                                   */
+/* ===================================================================== */
+
+/*  An OCC transaction captures a snapshot of the B+Tree at begin time,
+ *  buffers writes in a private set, and validates them against the live
+ *  tree at commit. Reads against the txn are lock-free; writes are
+ *  applied only at commit.
+ *
+ *  Concurrency: many `pyx_optimistic_txn` handles may exist
+ *  simultaneously, one per thread. Reads are mutex-free (mmap-backed
+ *  snapshot). The validate-and-apply step at commit briefly takes the
+ *  internal data lock.
+ *
+ *  Conflict semantics:
+ *    - Every recorded read is re-checked at commit; any divergence
+ *      yields PYX_WRITE_CONFLICT.
+ *    - `put` and `delete` add an implicit snapshot read of the target
+ *      key, so blind writes are also conflict-checked (lost-update
+ *      protection).
+ *    - `find_one` records the predicate + first-match doc_id;
+ *      validation re-runs it. (`find_all`, `find_range`, and full-scan
+ *      iterators are tracked in the Zig API but not yet exposed
+ *      through the C ABI — coming in a future version.)
+ *
+ *  On PYX_WRITE_CONFLICT, the txn handle is destroyed and the caller
+ *  should call `pyx_begin_optimistic` again to retry. The Zig API's
+ *  `Db.runOptimistic` retry helper (with exponential backoff + jitter)
+ *  is not yet exposed through the C ABI; implement your own retry
+ *  loop and watch the budget.
+ */
+
+pyx_status pyx_begin_optimistic(pyx_db *db, pyx_optimistic_txn **out_txn);
+
+/* Validate read set + apply write set under the data lock. On any
+ * outcome the txn handle is destroyed — do not call abort/commit
+ * after this returns. */
+pyx_status pyx_optimistic_commit(pyx_optimistic_txn *txn);
+
+/* Discard the txn without applying. Idempotent on NULL. */
+void       pyx_optimistic_abort(pyx_optimistic_txn *txn);
+
+pyx_status pyx_optimistic_insert(
+    pyx_optimistic_txn *txn,
+    const char *coll, size_t coll_len,
+    const uint8_t *doc, size_t doc_len,
+    uint64_t *out_doc_id);
+
+pyx_status pyx_optimistic_put(
+    pyx_optimistic_txn *txn,
+    const char *coll, size_t coll_len,
+    uint64_t doc_id,
+    const uint8_t *doc, size_t doc_len);
+
+pyx_status pyx_optimistic_delete(
+    pyx_optimistic_txn *txn,
+    const char *coll, size_t coll_len,
+    uint64_t doc_id);
+
+pyx_status pyx_optimistic_get(
+    pyx_optimistic_txn *txn,
+    const char *coll, size_t coll_len,
+    uint64_t doc_id,
+    pyx_buf *out);
+
+pyx_status pyx_optimistic_find_one(
+    pyx_optimistic_txn *txn,
+    const char *coll, size_t coll_len,
+    const char *field, size_t field_len,
+    const pyx_value *value,
+    uint64_t *out_doc_id);
 
 #ifdef __cplusplus
 } /* extern "C" */

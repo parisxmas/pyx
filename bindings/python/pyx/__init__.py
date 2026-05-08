@@ -17,16 +17,29 @@ import ctypes as C
 from contextlib import contextmanager
 from typing import Iterator, Optional, Union
 
+import random
+import time
+
 from . import _doc, _ffi
-from .errors import PyxError, from_status
+from .errors import (
+    PyxError,
+    RetryBudgetExhausted,
+    WriteConflict,
+    from_status,
+)
 
 __all__ = [
-    "Db",
+    "Bound",
     "Collection",
-    "Snapshot",
+    "Db",
+    "OptimisticTxn",
     "PyxError",
-    "version",
+    "RetryBudgetExhausted",
+    "Snapshot",
+    "TxnCollection",
+    "WriteConflict",
     "format_version",
+    "version",
 ]
 
 ScalarValue = Union[None, bool, int, float, str]
@@ -78,17 +91,46 @@ def _to_pyx_value(v: ScalarValue, pins: list) -> _ffi.PyxValue:
     return val
 
 
-def _to_bound(v: Optional["Bound"], pins: list) -> Optional[_ffi.PyxBound]:
-    """Convert None/Bound into a pyx_bound. None → no bound."""
+def _to_bound(v: Union[None, "Bound", "ScalarValue"], pins: list) -> Optional[_ffi.PyxBound]:
+    """Convert None/scalar/Bound into a pyx_bound. None → no bound; a
+    bare scalar is treated as `Bound.inclusive(scalar)` for the
+    common case where users want a closed range without typing
+    `Bound.inclusive(...)` twice."""
     if v is None:
         return None
-    if isinstance(v, Bound):
-        b = _ffi.PyxBound()
-        b.kind = v._kind
-        if v._value is not None:
-            b.value = _to_pyx_value(v._value, pins)
-        return b
-    raise TypeError("range bound must be a Bound instance or None")
+    if not isinstance(v, Bound):
+        # Bare scalar shorthand — defaults to inclusive.
+        v = Bound.inclusive(v)
+    b = _ffi.PyxBound()
+    b.kind = v._kind
+    if v._value is not None:
+        b.value = _to_pyx_value(v._value, pins)
+    return b
+
+
+def _bounds_from_kwargs(
+    gte=None, gt=None, lte=None, lt=None,
+) -> tuple[Optional["Bound"], Optional["Bound"]]:
+    """Build (lo, hi) Bounds from SQL-style kwargs.
+
+    Exactly one of gte/gt may be set (lower bound); same for lte/lt
+    (upper bound). Returns (None, None) for unbounded sides.
+    """
+    if gte is not None and gt is not None:
+        raise TypeError("pass either gte= or gt=, not both")
+    if lte is not None and lt is not None:
+        raise TypeError("pass either lte= or lt=, not both")
+    lo: Optional[Bound] = None
+    if gte is not None:
+        lo = Bound.inclusive(gte)
+    elif gt is not None:
+        lo = Bound.exclusive(gt)
+    hi: Optional[Bound] = None
+    if lte is not None:
+        hi = Bound.inclusive(lte)
+    elif lt is not None:
+        hi = Bound.exclusive(lt)
+    return lo, hi
 
 
 class Bound:
@@ -178,6 +220,47 @@ class Db:
     def drop_index(self, collection: str, field: str) -> None:
         cb, fb = _utf8(collection), _utf8(field)
         _check(_ffi.pyx_drop_index(self._handle, cb, len(cb), fb, len(fb)))
+
+    def begin_optimistic(self) -> "OptimisticTxn":
+        """Open an optimistic-concurrency transaction.
+
+        Reads against the txn are lock-free; writes are buffered and
+        applied at commit only after the read set validates. On a
+        commit-time conflict, `WriteConflict` is raised — typically
+        caught and retried via `Db.run_optimistic`.
+        """
+        out = C.c_void_p()
+        _check(_ffi.pyx_begin_optimistic(self._handle, C.byref(out)))
+        return OptimisticTxn(self, out)
+
+    def run_optimistic(self, fn, max_attempts: int = 8) -> None:
+        """Run `fn(txn)` inside an OCC transaction with auto-retry on
+        `WriteConflict`. Sleeps with exponential backoff + full jitter
+        between attempts (cap doubles from 100 µs up to 10 ms).
+
+        Raises `RetryBudgetExhausted` if `max_attempts` is reached
+        without success. Other exceptions from `fn` propagate after
+        aborting the txn.
+        """
+        cap_ns = 100_000  # 100 µs
+        max_ns = 10_000_000  # 10 ms
+        for _ in range(max_attempts):
+            txn = self.begin_optimistic()
+            try:
+                fn(txn)
+            except BaseException:
+                txn.abort()
+                raise
+            try:
+                txn.commit()
+                return
+            except WriteConflict:
+                sleep_ns = random.randrange(cap_ns) if cap_ns > 0 else 0
+                if sleep_ns > 0:
+                    time.sleep(sleep_ns / 1e9)
+                cap_ns = min(cap_ns * 2, max_ns)
+                continue
+        raise RetryBudgetExhausted(_ffi.PYX_RETRY_BUDGET_EXHAUSTED, "OCC retry budget exhausted")
 
 
 # ---------------------------------------------------------------------
@@ -296,16 +379,33 @@ class Collection:
     def find_range(
         self,
         field: str,
-        lo: Optional[Bound] = None,
-        hi: Optional[Bound] = None,
+        lo=None,
+        hi=None,
+        *,
+        gte=None, gt=None, lte=None, lt=None,
     ) -> Iterator[int]:
+        """Indexed range scan. Two equivalent calling styles:
+
+            # Positional, with bare scalars (defaults to inclusive):
+            users.find_range("age", 18, 65)              # 18 ≤ age ≤ 65
+            users.find_range("age", 18, None)            # 18 ≤ age
+            users.find_range("age", Bound.exclusive(18)) # 18 <  age (mixed OK)
+
+            # SQL-style kwargs:
+            users.find_range("age", gte=18, lt=65)       # 18 ≤ age <  65
+            users.find_range("age", gt=0)                #  0 <  age
+        """
+        if any(v is not None for v in (gte, gt, lte, lt)):
+            if lo is not None or hi is not None:
+                raise TypeError("mix of positional bounds and gte/gt/lte/lt kwargs")
+            lo, hi = _bounds_from_kwargs(gte, gt, lte, lt)
         return self._range(field, lo, hi, snapshot_handle=None)
 
     def _range(
         self,
         field: str,
-        lo: Optional[Bound],
-        hi: Optional[Bound],
+        lo,
+        hi,
         snapshot_handle,
     ) -> Iterator[int]:
         cb = _utf8(field)
@@ -412,7 +512,123 @@ class SnapshotCollection:
     def find_range(
         self,
         field: str,
-        lo: Optional[Bound] = None,
-        hi: Optional[Bound] = None,
+        lo=None,
+        hi=None,
+        *,
+        gte=None, gt=None, lte=None, lt=None,
     ) -> Iterator[int]:
+        if any(v is not None for v in (gte, gt, lte, lt)):
+            if lo is not None or hi is not None:
+                raise TypeError("mix of positional bounds and gte/gt/lte/lt kwargs")
+            lo, hi = _bounds_from_kwargs(gte, gt, lte, lt)
         return self._snap._db.collection(self._name)._range(field, lo, hi, self._snap._handle)
+
+
+# ---------------------------------------------------------------------
+# Optimistic-concurrency transactions
+# ---------------------------------------------------------------------
+
+class OptimisticTxn:
+    """Lock-free OCC transaction. Open via `Db.begin_optimistic` or
+    `Db.run_optimistic`. Reads happen against an mmap'd snapshot;
+    writes are buffered until commit, where validation checks every
+    observed key against the live tree."""
+
+    __slots__ = ("_db", "_handle")
+
+    def __init__(self, db: Db, handle):
+        self._db = db
+        self._handle = handle
+
+    def collection(self, name: str) -> "TxnCollection":
+        return TxnCollection(self, name)
+
+    def commit(self) -> None:
+        if not self._handle:
+            return
+        rc = _ffi.pyx_optimistic_commit(self._handle)
+        # The handle is destroyed on every outcome of commit.
+        self._handle = None
+        if rc == _ffi.PYX_WRITE_CONFLICT:
+            raise WriteConflict(rc, "OCC write conflict — retry")
+        _check(rc)
+
+    def abort(self) -> None:
+        if self._handle:
+            _ffi.pyx_optimistic_abort(self._handle)
+            self._handle = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *_):
+        # On exception: abort. On clean exit: caller is expected to
+        # have called commit; if not, abort to be safe.
+        if self._handle:
+            self.abort() if exc_type is not None else self.commit()
+
+    def __del__(self):
+        # Don't raise from __del__; just release.
+        if self._handle:
+            _ffi.pyx_optimistic_abort(self._handle)
+            self._handle = None
+
+
+class TxnCollection:
+    __slots__ = ("_txn", "_name", "_name_bytes")
+
+    def __init__(self, txn: OptimisticTxn, name: str):
+        self._txn = txn
+        self._name = name
+        self._name_bytes = name.encode("utf-8")
+
+    def insert(self, doc: dict) -> int:
+        arr, n = _doc_to_bytes(doc)
+        out = C.c_uint64()
+        _check(_ffi.pyx_optimistic_insert(
+            self._txn._handle, self._name_bytes, len(self._name_bytes),
+            arr, n, C.byref(out),
+        ))
+        return int(out.value)
+
+    def put(self, doc_id: int, doc: dict) -> None:
+        arr, n = _doc_to_bytes(doc)
+        _check(_ffi.pyx_optimistic_put(
+            self._txn._handle, self._name_bytes, len(self._name_bytes),
+            doc_id, arr, n,
+        ))
+
+    def get(self, doc_id: int) -> Optional[dict]:
+        buf = _ffi.PyxBuf()
+        rc = _ffi.pyx_optimistic_get(
+            self._txn._handle, self._name_bytes, len(self._name_bytes),
+            doc_id, C.byref(buf),
+        )
+        if rc == _ffi.PYX_NOT_FOUND:
+            return None
+        _check(rc)
+        return _read_buf(buf)
+
+    def delete(self, doc_id: int) -> bool:
+        rc = _ffi.pyx_optimistic_delete(
+            self._txn._handle, self._name_bytes, len(self._name_bytes), doc_id,
+        )
+        if rc == _ffi.PYX_NOT_FOUND:
+            return False
+        _check(rc)
+        return True
+
+    def find_one(self, field: str, value: ScalarValue) -> Optional[int]:
+        pins: list = []
+        v = _to_pyx_value(value, pins)
+        out = C.c_uint64()
+        cb = _utf8(field)
+        rc = _ffi.pyx_optimistic_find_one(
+            self._txn._handle, self._name_bytes, len(self._name_bytes),
+            cb, len(cb), C.byref(v), C.byref(out),
+        )
+        del pins
+        if rc == _ffi.PYX_NOT_FOUND:
+            return None
+        _check(rc)
+        return int(out.value)

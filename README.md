@@ -181,25 +181,42 @@ with pyx.Db.open("mydb.pyx") as db:
     db.create_index("users", "age")
     print(users.find_one("age", 30))
 
-    for doc_id in users.find_range(
-        "age",
-        pyx.Bound.inclusive(18),
-        pyx.Bound.exclusive(65),
-    ):
+    # Three equivalent ways to range-query — pick the one you like:
+    for doc_id in users.find_range("age", 18, 65):                   # bare scalars = inclusive
         print(doc_id, users.get(doc_id))
+    for doc_id in users.find_range("age", gte=18, lt=65):            # SQL-style kwargs
+        ...
+    for doc_id in users.find_range("age",
+                                   pyx.Bound.inclusive(18),
+                                   pyx.Bound.exclusive(65)):         # explicit Bound (any mix)
+        ...
 
     with db.snapshot() as snap:
         for doc_id, doc in snap.collection("users"):  # lock-free
             print(doc_id, doc)
 ```
 
-Multi-op transactions:
+Multi-op transactions (pessimistic — holds the data lock):
 
 ```python
 with db.transaction():
     users.insert({"name": "bob"})
     users.insert({"name": "carol"})
 # commits on normal exit, aborts on exception.
+```
+
+Optimistic transactions (lock-free reads, conflict-checked at commit,
+auto-retry with backoff):
+
+```python
+def transfer(txn):
+    accounts = txn.collection("accounts")
+    src = accounts.get(src_id)
+    dst = accounts.get(dst_id)
+    accounts.put(src_id, {**src, "balance": src["balance"] - amount})
+    accounts.put(dst_id, {**dst, "balance": dst["balance"] + amount})
+
+db.run_optimistic(transfer)   # retries on WriteConflict
 ```
 
 See [`bindings/python/README.md`](bindings/python/README.md) for install
