@@ -377,6 +377,55 @@ class Collection:
         _check(rc)
         return _read_buf(buf)
 
+    def get_many(self, doc_ids) -> dict[int, dict]:
+        """Look up many docs in one shot. Returns ``{doc_id: doc}`` for
+        every id that's present (missing ids are simply absent from the
+        result). Several times faster than calling ``get`` in a loop on
+        the Python side because all the ctypes round-trips collapse into
+        one. Order of `doc_ids` doesn't matter; duplicates are allowed
+        but appear once in the result.
+
+        Implementation: passes a packed (ids[], out_lens[], out_buf[])
+        tuple to libpyx; the value bytes for each found id are written
+        contiguously into out_buf in input order, with out_lens[i] = 0
+        marking the misses. If the buffer is too small, libpyx returns
+        the required size and we retry with a larger one.
+        """
+        ids = list(doc_ids)
+        n = len(ids)
+        if n == 0:
+            return {}
+        ids_arr = (C.c_uint64 * n)(*ids)
+        out_lens = (C.c_uint32 * n)()
+        cap = max(n * 256, 4096)  # heuristic: ~256 bytes/doc avg
+        for _ in range(8):  # bounded retries — each pass either fits or doubles
+            out_buf = (C.c_uint8 * cap)()
+            used = C.c_size_t(0)
+            rc = _ffi.pyx_get_many(
+                self._db._handle, self._name_bytes, len(self._name_bytes),
+                ids_arr, n, out_lens, out_buf, cap, C.byref(used),
+            )
+            if rc == _ffi.PYX_OK:
+                break
+            if rc == _ffi.PYX_BUFFER_TOO_SMALL:
+                cap = max(used.value, cap * 2)
+                continue
+            _check(rc)
+        else:
+            raise RuntimeError("pyx_get_many: buffer-too-small loop did not converge")
+        # Decode: values are packed in ids[] order; out_lens[i] = 0 for misses.
+        result: dict[int, dict] = {}
+        offset = 0
+        # Slice once into a memoryview to avoid per-iteration ctypes indexing.
+        mv = memoryview(out_buf).cast("B")
+        for i in range(n):
+            ln = out_lens[i]
+            if ln == 0:
+                continue
+            result[ids[i]] = _doc.decode(bytes(mv[offset:offset + ln]))
+            offset += ln
+        return result
+
     def delete(self, doc_id: int) -> bool:
         rc = _ffi.pyx_delete(
             self._db._handle, self._name_bytes, len(self._name_bytes), doc_id,

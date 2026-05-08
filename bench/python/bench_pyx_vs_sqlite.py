@@ -132,6 +132,27 @@ def w2_pyx(path: str, n_seed: int, n_reads: int) -> float:
     return elapsed
 
 
+def w2_pyx_batched(path: str, n_seed: int, n_reads: int, batch: int) -> float:
+    """Same workload as w2_pyx but using `get_many` (phase 4) — lookups
+    are issued in chunks of `batch` ids per ctypes call."""
+    cleanup(path)
+    db = pyx.Db.open(path)
+    c = db.collection("notes")
+    ids = [c.insert({"i": i, "title": f"note-{i}"}) for i in range(n_seed)]
+    import random
+    rng = random.Random(42)
+    targets = [rng.choice(ids) for _ in range(n_reads)]
+
+    t0 = time.perf_counter()
+    for start in range(0, n_reads, batch):
+        c.get_many(targets[start:start + batch])
+    elapsed = time.perf_counter() - t0
+
+    db.close()
+    cleanup(path)
+    return elapsed
+
+
 def w2_sqlite(path: str, n_seed: int, n_reads: int) -> float:
     cleanup(path)
     conn = open_sqlite(path)
@@ -149,6 +170,36 @@ def w2_sqlite(path: str, n_seed: int, n_reads: int) -> float:
     cur = conn.cursor()
     for did in targets:
         cur.execute("SELECT i, title FROM notes WHERE id = ?", (did,)).fetchone()
+    elapsed = time.perf_counter() - t0
+
+    conn.close()
+    cleanup(path)
+    return elapsed
+
+
+def w2_sqlite_batched(path: str, n_seed: int, n_reads: int, batch: int) -> float:
+    """Same as w2_sqlite but each batch issues a single
+    `WHERE id IN (?, ?, …)` query — SQLite's analogue of `get_many`."""
+    cleanup(path)
+    conn = open_sqlite(path)
+    conn.execute(
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, i INTEGER, title TEXT)"
+    )
+    for i in range(n_seed):
+        conn.execute("INSERT INTO notes (i, title) VALUES (?, ?)", (i, f"note-{i}"))
+
+    import random
+    rng = random.Random(42)
+    targets = [rng.randint(1, n_seed) for _ in range(n_reads)]
+
+    t0 = time.perf_counter()
+    cur = conn.cursor()
+    for start in range(0, n_reads, batch):
+        chunk = targets[start:start + batch]
+        placeholders = ",".join("?" * len(chunk))
+        cur.execute(
+            f"SELECT id, i, title FROM notes WHERE id IN ({placeholders})", chunk,
+        ).fetchall()
     elapsed = time.perf_counter() - t0
 
     conn.close()
@@ -320,6 +371,8 @@ def main() -> int:
                         help="processes for W3/W4 (default %(default)s)")
     parser.add_argument("--n-per", type=int, default=200,
                         help="rows per process for W3/W4 (default %(default)s)")
+    parser.add_argument("--batch-size", type=int, default=64,
+                        help="ids per batched-get call for W2b (default %(default)s)")
     parser.add_argument("--skip-w4", action="store_true",
                         help="skip the shared-table contention bench")
     args = parser.parse_args()
@@ -350,6 +403,15 @@ def main() -> int:
             name="W2 random reads",
             pyx_s=w2_pyx(pyx_path, args.n_inserts, args.n_reads),
             sqlite_s=w2_sqlite(sql_path, args.n_inserts, args.n_reads),
+            pyx_ops=args.n_reads,
+            sqlite_ops=args.n_reads,
+        ))
+
+        print(f"W2b — batched reads (chunks of {args.batch_size}; pyx get_many vs SQL IN-list)...")
+        results.append(Result(
+            name=f"W2b batched/{args.batch_size}",
+            pyx_s=w2_pyx_batched(pyx_path, args.n_inserts, args.n_reads, args.batch_size),
+            sqlite_s=w2_sqlite_batched(sql_path, args.n_inserts, args.n_reads, args.batch_size),
             pyx_ops=args.n_reads,
             sqlite_ops=args.n_reads,
         ))

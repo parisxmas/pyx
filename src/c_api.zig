@@ -36,6 +36,10 @@ const Status = enum(c_int) {
     unsupported_field_type = -11,
     write_conflict = -12,
     retry_budget_exhausted = -13,
+    /// Caller's output buffer is too small. `*out_buf_used` (or
+    /// equivalent) is set to the required size; caller should retry
+    /// with a buffer at least that large.
+    buffer_too_small = -14,
     internal = -99,
 };
 
@@ -78,6 +82,7 @@ const status_end: c_int = @intFromEnum(Status.end);
 const status_invalid_arg: c_int = @intFromEnum(Status.invalid_arg);
 const status_oom: c_int = @intFromEnum(Status.out_of_memory);
 const status_write_conflict: c_int = @intFromEnum(Status.write_conflict);
+const status_buffer_too_small: c_int = @intFromEnum(Status.buffer_too_small);
 
 // ====================================================================
 // Per-thread last-error buffer.
@@ -358,6 +363,69 @@ export fn pyx_get(
         return status_ok;
     }
     return status_not_found;
+}
+
+/// Batched get (phase 4) — collapses N point reads into one C call so
+/// Python callers don't pay the per-call ctypes overhead per id. Layout:
+///
+///   inputs:  ids[n_ids]               u64 doc ids (any order)
+///   outputs: out_lens[n_ids]          u32 bytes-per-doc; 0 == not found
+///            out_buf[out_buf_cap]     packed bytes for the values, in
+///                                     ids[] order, no separators (use
+///                                     out_lens[] to slice)
+///            *out_buf_used            total bytes written (or required
+///                                     if return is buffer_too_small)
+///
+/// On `buffer_too_small`, `*out_buf_used` is set to the total bytes
+/// every found doc would need; caller should retry with a buffer of at
+/// least that size. The retry path scans every id again (fast — the
+/// pages are already warm in the kernel page cache).
+export fn pyx_get_many(
+    db: ?*State,
+    coll: ?[*]const u8, coll_len: usize,
+    ids: ?[*]const u64, n_ids: usize,
+    out_lens: ?[*]u32,
+    out_buf: ?[*]u8, out_buf_cap: usize,
+    out_buf_used: ?*usize,
+) c_int {
+    const s = db orelse return status_invalid_arg;
+    const c = nameSliceFromCArg(coll, coll_len) orelse return status_invalid_arg;
+    if (out_buf_used) |p| p.* = 0;
+    if (n_ids == 0) return status_ok;
+    const ids_ptr = ids orelse return status_invalid_arg;
+    const lens_ptr = out_lens orelse return status_invalid_arg;
+    const buf_ptr = out_buf;
+
+    const collection = s.db.collection(c);
+    var offset: usize = 0;
+    var overflowed = false;
+
+    var i: usize = 0;
+    while (i < n_ids) : (i += 1) {
+        const result = collection.get(s.allocator, ids_ptr[i]) catch |err| {
+            setLastError("pyx_get_many: {t}", .{err});
+            return statusFromError(err);
+        };
+        if (result) |bytes| {
+            defer s.allocator.free(bytes);
+            if (overflowed or offset + bytes.len > out_buf_cap) {
+                // Past the buffer — keep tallying the total required size.
+                offset += bytes.len;
+                overflowed = true;
+                lens_ptr[i] = 0;
+                continue;
+            }
+            const dst = buf_ptr orelse return status_invalid_arg;
+            @memcpy(dst[offset..][0..bytes.len], bytes);
+            lens_ptr[i] = @intCast(bytes.len);
+            offset += bytes.len;
+        } else {
+            lens_ptr[i] = 0;
+        }
+    }
+
+    if (out_buf_used) |p| p.* = offset;
+    return if (overflowed) status_buffer_too_small else status_ok;
 }
 
 export fn pyx_delete(

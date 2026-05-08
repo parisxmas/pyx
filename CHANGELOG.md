@@ -8,6 +8,22 @@ tag goes under `## Unreleased`.
 ## Unreleased
 
 ### Added
+- Phase 4 of the post-0.4.0 work: **batched-get API**.
+  `Collection.get_many(ids) -> {id: doc}` issues one ctypes call
+  for any number of doc ids and decodes the results in input
+  order. The C ABI is `pyx_get_many(db, coll, ids[], n_ids,
+  out_lens[], out_buf, out_buf_cap, *out_buf_used)` — values
+  are packed into a caller-allocated buffer; if the buffer is
+  too small, libpyx returns the required size and the Python
+  wrapper retries with `max(used, cap*2)`. New status code
+  `PYX_BUFFER_TOO_SMALL = -14`.
+
+  Measured ~1.5× speedup on random-read workloads at any batch
+  size ≥ 16; the remaining gap to SQLite's `WHERE id IN (…)` on
+  this benchmark is per-id tree descents (each `get` walks the
+  tree from root) and per-value Python decode, not ctypes
+  overhead. Sorted-scan + native decode are phase 5 candidates.
+
 - Keyspace sharding, phase 3: **per-collection writer locks**.
   Two processes (or two `Db` handles) committing to *different*
   collections no longer block each other on the cross-process

@@ -105,6 +105,7 @@ PYX_NO_SUCH_INDEX = -10
 PYX_UNSUPPORTED_FIELD_TYPE = -11
 PYX_WRITE_CONFLICT = -12
 PYX_RETRY_BUDGET_EXHAUSTED = -13
+PYX_BUFFER_TOO_SMALL = -14
 PYX_INTERNAL = -99
 
 # Value type tags.
@@ -181,6 +182,17 @@ pyx_delete = _bind(
     "pyx_delete",
     C.c_int,
     C.c_void_p, C.c_char_p, C.c_size_t, C.c_uint64,
+)
+
+# Batched get (phase 4)
+pyx_get_many = _bind(
+    "pyx_get_many",
+    C.c_int,
+    C.c_void_p, C.c_char_p, C.c_size_t,
+    C.POINTER(C.c_uint64), C.c_size_t,
+    C.POINTER(C.c_uint32),
+    C.POINTER(C.c_uint8), C.c_size_t,
+    C.POINTER(C.c_size_t),
 )
 
 # Iteration
