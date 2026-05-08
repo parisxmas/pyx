@@ -12,9 +12,17 @@ tag goes under `## Unreleased`.
   `mydb.pyx-shm` sibling file, mmap'd MAP_SHARED by every opener.
   Layout reserves 4 KB for cross-process state (magic, version,
   shared atomic counters); `next_doc_id` is the first counter moved
-  into shm. Single-process behavior is unchanged. Phase 1B will move
-  `num_pages`, `next_lsn`, and `wal.end_offset`; phase 1C adds the
-  fcntl WRITER lock that makes cross-process writes safe.
+  into shm.
+- Multi-process foundation, phase 1B: the remaining three runtime
+  counters move to shm — `num_pages`, `next_lsn`, and
+  `wal.end_offset`. `Wal.open` takes the shm-resident
+  `wal_end_offset` atomic and writes-through on every flush /
+  reset / replay-truncate. `Pager.allocPage` allocates via
+  `shm.numPages().fetchAdd`; `commitAppend` syncs the on-disk
+  header from shm; `abort` rolls the shm page counter back to the
+  txn-snapshot value. Single-process behaviour unchanged (84 tests
+  green). Phase 1C adds the fcntl WRITER lock that makes
+  cross-process commits safe.
 - Compound indexes (Zig core, phase 1 of 3): `Db.createCompoundIndex`,
   `Db.dropCompoundIndex`, `Collection.findOneCompound`. The index is
   ordered — `(last, first)` is a different index from `(first, last)`

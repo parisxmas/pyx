@@ -160,14 +160,14 @@ pub const Pager = struct {
     /// root-to-leaf descent. Cleared on commit/abort, on splits, and on
     /// any modification that invalidates the cursor (e.g. deletes).
     txn_append_hint: ?PageId,
-    next_lsn: u64,
     sync_mode: SyncMode,
-    /// Cross-process shared-memory file. Phase 1A places the
-    /// `next_doc_id` atomic counter here so any process that opens the
-    /// same DB sees a single source of truth for ID allocation. Phase
-    /// 1B will move `num_pages`, `next_lsn`, and `wal.end_offset`;
-    /// phase 1C adds the fcntl WRITER lock. Multi-reader visibility
-    /// (wal-index) lands in phase 2.
+    /// Cross-process shared-memory file. Phase 1B places the four
+    /// runtime counters here — `next_doc_id`, `num_pages`, `next_lsn`,
+    /// and `wal.end_offset` — so any process that opens the same DB
+    /// sees a single source of truth. Phase 1C adds the fcntl WRITER
+    /// lock that makes the read-modify-write of those counters safe
+    /// across processes. Multi-reader visibility (wal-index) lands in
+    /// phase 2.
     shm: shm_mod.Shm,
 
     pub fn open(allocator: Allocator, io: Io, dir: Dir, sub_path: []const u8) !Pager {
@@ -196,9 +196,6 @@ pub const Pager = struct {
             return Error.TruncatedFile;
         }
 
-        var wal = try wal_mod.Wal.open(allocator, io, dir, wal_path);
-        errdefer wal.close();
-
         var hdr_buf: [page_size]u8 = undefined;
         const n = try file.readPositionalAll(io, &hdr_buf, 0);
         if (n < page_size) return Error.TruncatedFile;
@@ -206,16 +203,15 @@ pub const Pager = struct {
 
         var shm = try shm_mod.Shm.open(io, dir, shm_path);
         errdefer shm.close();
-        // Phase 1A: always seed from the on-disk header. With only one
-        // process opening the DB this is correct. Phase 1C will gate
-        // re-seeding on the RECOVERY fcntl lock so multiple openers
-        // don't clobber each other's atomics.
-        shm.seedFromHeader(
-            header.next_doc_id,
-            header.num_pages,
-            1, // next_lsn placeholder; phase 1B moves the real value here
-            wal.end_offset,
-        );
+
+        var wal = try wal_mod.Wal.open(allocator, io, dir, wal_path, shm.walEndOffset());
+        errdefer wal.close();
+
+        // Phase 1B: seed from the on-disk header. With only one process
+        // opening the DB this is correct. Phase 1C will gate re-seeding
+        // on the RECOVERY fcntl lock so concurrent openers don't
+        // clobber each other's atomics.
+        shm.seedFromHeader(header.next_doc_id, header.num_pages, 1);
 
         return .{
             .allocator = allocator,
@@ -232,7 +228,6 @@ pub const Pager = struct {
             .pending = .empty,
             .txn_arena = std.heap.ArenaAllocator.init(allocator),
             .txn_append_hint = null,
-            .next_lsn = 1,
             .sync_mode = .full,
             .shm = shm,
         };
@@ -339,7 +334,11 @@ pub const Pager = struct {
 
     pub fn begin(self: *Pager) !void {
         if (self.in_txn) return Error.TxnAlreadyActive;
+        // Capture the live page count from shm so abort can restore it
+        // — `txn_header_snapshot.num_pages` is now the pre-txn shm
+        // value, not the (possibly stale) on-disk header value.
         self.txn_header_snapshot = self.header;
+        self.txn_header_snapshot.num_pages = self.shm.numPages().load(.monotonic);
         self.in_txn = true;
     }
 
@@ -381,6 +380,11 @@ pub const Pager = struct {
             self.header.next_doc_id = reserved;
             self.header_dirty = true;
         }
+        const live_num_pages = self.shm.numPages().load(.monotonic);
+        if (live_num_pages > self.header.num_pages) {
+            self.header.num_pages = live_num_pages;
+            self.header_dirty = true;
+        }
 
         if (self.header_dirty) {
             const gop = try self.dirty.getOrPut(self.allocator, 0);
@@ -394,18 +398,20 @@ pub const Pager = struct {
 
         // Stage all records into the WAL's in-memory buffer first; if any
         // append fails we drop the partial batch and bail before touching
-        // disk.
+        // disk. LSNs come from the shm-resident counter so they're
+        // unique across processes (relevant once the phase-1C WRITER
+        // lock makes multi-process commits safe).
         errdefer self.wal.discardPending();
+        const lsn_counter = self.shm.nextLsn();
         for (self.pending.items) |rec| {
+            const lsn = lsn_counter.fetchAdd(1, .monotonic);
             switch (rec) {
-                .put => |p| try self.wal.appendPut(self.next_lsn, p.key, p.value),
-                .delete => |k| try self.wal.appendDelete(self.next_lsn, k),
+                .put => |p| try self.wal.appendPut(lsn, p.key, p.value),
+                .delete => |k| try self.wal.appendDelete(lsn, k),
             }
-            self.next_lsn += 1;
         }
-        const commit_lsn = self.next_lsn;
+        const commit_lsn = lsn_counter.fetchAdd(1, .monotonic);
         try self.wal.appendCommit(commit_lsn, self.header.next_doc_id);
-        self.next_lsn += 1;
         // One pwritev for the whole batch (PUTs + COMMIT). Records reach
         // the kernel page cache here; durability is the next phase's job.
         try self.wal.flush();
@@ -460,6 +466,11 @@ pub const Pager = struct {
         _ = self.txn_arena.reset(.retain_capacity);
         self.txn_append_hint = null;
         self.header = self.txn_header_snapshot;
+        // Roll the live page counter back so aborted txns don't leak
+        // page ids — matches pre-shm behaviour. Safe to do without
+        // coordination here because we're inside a single in-process
+        // txn (pre-1C) or holding the WRITER lock (1C+).
+        self.shm.numPages().store(self.txn_header_snapshot.num_pages, .release);
         self.header_dirty = false;
         self.in_txn = false;
     }
@@ -546,8 +557,11 @@ pub const Pager = struct {
             self.header_dirty = true;
             return id;
         }
-        const id: PageId = @intCast(self.header.num_pages);
-        self.header.num_pages += 1;
+        // Atomic-counter allocation so concurrent processes (under the
+        // phase-1C WRITER lock) hand out unique page ids. The on-disk
+        // header is brought up to the live count at the start of every
+        // `commitAppend` — same pattern as `next_doc_id`.
+        const id: PageId = @intCast(self.shm.numPages().fetchAdd(1, .monotonic));
         self.header_dirty = true;
         const zero: [page_size]u8 = @splat(0);
         try self.writePageInternal(id, &zero);
@@ -564,7 +578,7 @@ pub const Pager = struct {
 
     fn freePageInner(self: *Pager, id: PageId) !void {
         if (id == 0) return Error.CannotFreeHeader;
-        if (id >= self.header.num_pages) return Error.InvalidPageId;
+        if (id >= self.shm.numPages().load(.monotonic)) return Error.InvalidPageId;
         var page: [page_size]u8 = @splat(0);
         mem.writeInt(u32, page[0..4], self.header.free_head, .little);
         try self.writePageInternal(id, &page);
@@ -573,12 +587,12 @@ pub const Pager = struct {
     }
 
     pub fn read(self: *Pager, id: PageId, buf: *[page_size]u8) !void {
-        if (id == 0 or id >= self.header.num_pages) return Error.InvalidPageId;
+        if (id == 0 or id >= self.shm.numPages().load(.monotonic)) return Error.InvalidPageId;
         try self.readPageInternal(id, buf);
     }
 
     pub fn write(self: *Pager, id: PageId, buf: *const [page_size]u8) !void {
-        if (id == 0 or id >= self.header.num_pages) return Error.InvalidPageId;
+        if (id == 0 or id >= self.shm.numPages().load(.monotonic)) return Error.InvalidPageId;
         if (self.in_txn) {
             try self.writePageInternal(id, buf);
             return;

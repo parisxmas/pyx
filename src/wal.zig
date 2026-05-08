@@ -101,7 +101,21 @@ pub const Wal = struct {
     fast_returns: std.atomic.Value(u64),      // covered before entering the wait loop
     fsync_total_ns: std.atomic.Value(u64),    // sum of fsync syscall durations
 
-    pub fn open(allocator: Allocator, io: Io, dir: Dir, sub_path: []const u8) !Wal {
+    /// Cross-process mirror of `end_offset`. Lives in the `-shm`
+    /// region so any process that opens the same DB sees the latest
+    /// append cursor. Updated alongside every mutation of
+    /// `end_offset`; with the phase-1C WRITER fcntl lock, only one
+    /// process holds the writer role at a time, so the read-modify-
+    /// write of "load → pwrite → store" is uncontended.
+    shm_end_offset: *std.atomic.Value(u64),
+
+    pub fn open(
+        allocator: Allocator,
+        io: Io,
+        dir: Dir,
+        sub_path: []const u8,
+        shm_end_offset: *std.atomic.Value(u64),
+    ) !Wal {
         const file = try dir.createFile(io, sub_path, .{
             .read = true,
             .truncate = false,
@@ -116,6 +130,7 @@ pub const Wal = struct {
             mem.writeInt(u32, hdr[12..16], 4096, .little);
             try file.writePositionalAll(io, &hdr, 0);
             try file.sync(io);
+            shm_end_offset.store(wal_header_size, .release);
             return .{
                 .allocator = allocator,
                 .io = io,
@@ -131,6 +146,7 @@ pub const Wal = struct {
                 .follower_waits = .init(0),
                 .fast_returns = .init(0),
                 .fsync_total_ns = .init(0),
+                .shm_end_offset = shm_end_offset,
             };
         }
         if (len < wal_header_size) return Error.TruncatedWal;
@@ -139,6 +155,7 @@ pub const Wal = struct {
         if (n < wal_header_size) return Error.TruncatedWal;
         if (!mem.eql(u8, hdr[0..8], &wal_magic)) return Error.NotAWal;
         if (mem.readInt(u32, hdr[8..12], .little) != wal_version) return Error.UnsupportedWal;
+        shm_end_offset.store(len, .release);
         return .{
             .allocator = allocator,
             .io = io,
@@ -154,6 +171,7 @@ pub const Wal = struct {
             .follower_waits = .init(0),
             .fast_returns = .init(0),
             .fsync_total_ns = .init(0),
+            .shm_end_offset = shm_end_offset,
         };
     }
 
@@ -238,6 +256,7 @@ pub const Wal = struct {
         if (self.pending.items.len == 0) return;
         try self.file.writePositionalAll(self.io, self.pending.items, self.end_offset);
         self.end_offset += self.pending.items.len;
+        self.shm_end_offset.store(self.end_offset, .release);
         self.pending.clearRetainingCapacity();
     }
 
@@ -340,6 +359,7 @@ pub const Wal = struct {
         try self.file.setLength(self.io, wal_header_size);
         try self.file.sync(self.io);
         self.end_offset = wal_header_size;
+        self.shm_end_offset.store(self.end_offset, .release);
 
         // After reset, every record that was ever flushed is durable in
         // the data file (checkpoint flushed page_cache + fsync'd before
@@ -380,6 +400,7 @@ pub const Wal = struct {
         if (last_commit_end < self.end_offset) {
             try self.file.setLength(self.io, last_commit_end);
             self.end_offset = last_commit_end;
+            self.shm_end_offset.store(self.end_offset, .release);
         }
 
         offset = wal_header_size;
@@ -467,7 +488,8 @@ test "logical wal append + replay applies committed records only" {
     const io = testing.io;
     const ally = testing.allocator;
 
-    var w = try Wal.open(ally, io, tmp.dir, "wal");
+    var stub_end_offset: std.atomic.Value(u64) = .init(0);
+    var w = try Wal.open(ally, io, tmp.dir, "wal", &stub_end_offset);
     defer w.close();
 
     try w.appendPut(1, "alpha", "A");
@@ -523,7 +545,8 @@ test "wal reset truncates back to header" {
     const io = testing.io;
     const ally = testing.allocator;
 
-    var w = try Wal.open(ally, io, tmp.dir, "wal");
+    var stub_end_offset: std.atomic.Value(u64) = .init(0);
+    var w = try Wal.open(ally, io, tmp.dir, "wal", &stub_end_offset);
     defer w.close();
 
     try w.appendPut(1, "k", "v");

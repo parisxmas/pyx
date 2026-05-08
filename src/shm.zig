@@ -149,12 +149,11 @@ pub const Shm = struct {
         next_doc_id: u64,
         num_pages: u64,
         next_lsn: u64,
-        wal_end_offset: u64,
     ) void {
         self.nextDocId().store(next_doc_id, .release);
         self.numPages().store(num_pages, .release);
         self.nextLsn().store(next_lsn, .release);
-        self.walEndOffset().store(wal_end_offset, .release);
+        // wal_end_offset is owned by Wal — set when the WAL is opened.
     }
 };
 

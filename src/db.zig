@@ -134,7 +134,7 @@ fn replayWal(allocator: Allocator, pager: *pager_mod.Pager) !void {
     }
 
     const max_lsn = try pager.wal.replay(allocator, &ctx, ReplayCtx.handle);
-    pager.next_lsn = max_lsn + 1;
+    pager.shm.nextLsn().store(max_lsn + 1, .release);
 
     try pager.flushHeader();
     try pager.checkpoint();
