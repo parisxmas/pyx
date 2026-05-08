@@ -21,9 +21,11 @@ Empirically verified with this exact `notes_project`:
 
 ```
 $ gunicorn --workers 4 --bind 127.0.0.1:8000 notes_project.wsgi:application
-$ # 1000 parallel POST /notes/new/ → 1000/1000 succeed in ~1.16s
-$ # GET /notes/?u=bob   → 1000 docs visible
-$ # 50 parallel POST /notes/1/edit/ → all 50 succeed via OCC auto-retry
+
+  1000 parallel POST /notes/new/   → 1000× HTTP 302, ~1.2 s wall clock
+                                     (≈830 commits/s aggregate)
+  GET /notes/?u=bob                → 1000 docs visible
+  50 parallel POST /notes/1/edit/  → all 50 succeed via OCC auto-retry
 ```
 
 So:

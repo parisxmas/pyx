@@ -7,6 +7,13 @@ tag goes under `## Unreleased`.
 
 ## Unreleased
 
+### Changed
+- README's "Concurrency model" lock-byte table updated to reflect
+  the WRITER-only protocol (the RECOVERY byte is gone). Django
+  example's verified-numbers paragraph adjusted to `~1.2 s,
+  ≈830 commits/s` to match the latest re-run (within run-to-run
+  variance of the 1.16 s number from the previous commit).
+
 ### Added
 - Multi-process foundation, phase 1A: `src/shm.zig` introduces a
   `mydb.pyx-shm` sibling file, mmap'd MAP_SHARED by every opener.
