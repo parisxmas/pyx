@@ -346,11 +346,11 @@ APFS on internal SSD, Zig 0.16.0, SQLite 3.53.0 (Homebrew).
 
 | Operation               | pyx (normal) | SQLite WAL+NORMAL | SQLite default | pyx vs WAL |
 |-------------------------|-------------:|------------------:|---------------:|-----------:|
-| insert (auto-commit)    | **261 k/s**  | 115 k/s           |  5.5 k/s       | **2.3×**   |
-| insert (batched in txn) | **4.01 M/s** | 3.30 M/s          |  2.84 M/s      | **1.2×**   |
-| random `get` by id      | **3.10 M/s** | 1.27 M/s          |  357 k/s       | **2.4×**   |
-| full collection iterate | **233 M docs/s** | 32 M docs/s    |  32 M docs/s   | **7.3×**   |
-| indexed `findOne`       | **1.40 M/s** | 1.24 M/s          |  357 k/s       | **1.1×**   |
+| insert (auto-commit)    | **237 k/s**  | 109 k/s           |  5.2 k/s       | **2.2×**   |
+| insert (batched in txn) | **4.53 M/s** | 3.21 M/s          |  2.83 M/s      | **1.4×**   |
+| random `get` by id      | **3.06 M/s** | 1.13 M/s          |  386 k/s       | **2.7×**   |
+| full collection iterate | **224 M docs/s** | 31 M docs/s    |  31 M docs/s   | **7.2×**   |
+| indexed `findOne`       | **1.31 M/s** | 1.24 M/s          |  389 k/s       | **1.1×**   |
 
 `zig build bench` / `zig build bench-sqlite` to reproduce.
 
@@ -361,10 +361,10 @@ indexed point query):
 
 | Threads | pyx aggregate | SQLite WAL aggregate | pyx advantage |
 |---------|--------------:|---------------------:|--------------:|
-| 1       | 1.40 M ops/s  | 716 k ops/s          | 1.9×          |
+| 1       | 1.38 M ops/s  | 716 k ops/s          | 1.9×          |
 | 2       | 2.75 M ops/s  | 1.02 M ops/s         | 2.7×          |
-| 4       | 5.40 M ops/s  | 849 k ops/s          | 6.4×          |
-| 8       | **7.69 M ops/s** | 328 k ops/s        | **23×**       |
+| 4       | 5.37 M ops/s  | 828 k ops/s          | 6.5×          |
+| 8       | **7.42 M ops/s** | 325 k ops/s        | **23×**       |
 
 pyx scales near-linearly because snapshot reads are lock-free and
 mmap-backed. SQLite's WAL reader path serialises on the wal-index
@@ -375,13 +375,13 @@ degrades past four.
 
 | Phase    | pyx writer        | pyx readers   | SQLite writer | SQLite readers |
 |----------|------------------:|--------------:|--------------:|---------------:|
-| 1w + 1r  | 624 k inserts/s   | 884 k ops/s   | 660 k inserts/s | 613 k ops/s  |
-| 1w + 2r  | 312 k inserts/s   | 2.61 M ops/s  | 353 k inserts/s | 661 k ops/s  |
-| 1w + 4r  | 271 k inserts/s   | 4.07 M ops/s  | 147 k inserts/s | 564 k ops/s  |
-| 1w + 8r  | **243 k inserts/s** | **5.40 M ops/s** | **44 k inserts/s** | **332 k ops/s** |
+| 1w + 1r  | 676 k inserts/s   | 1.32 M ops/s  | 661 k inserts/s | 603 k ops/s  |
+| 1w + 2r  | 349 k inserts/s   | 2.64 M ops/s  | 352 k inserts/s | 674 k ops/s  |
+| 1w + 4r  | 293 k inserts/s   | 4.25 M ops/s  | 137 k inserts/s | 527 k ops/s  |
+| 1w + 8r  | **212 k inserts/s** | **6.18 M ops/s** | **43 k inserts/s** | **328 k ops/s** |
 
 Under concurrent read pressure, pyx's writer holds steady around
-240 k inserts/s while SQLite's collapses to 44 k. pyx's readers keep
+210 k inserts/s while SQLite's collapses to 43 k. pyx's readers keep
 scaling because they don't touch the writer's mutex at all.
 
 `zig build bench-concurrent` / `zig build bench-concurrent-sqlite` to
@@ -392,17 +392,16 @@ reproduce.
 Phase C of `bench-concurrent`: N writer threads, each issuing
 auto-commit inserts (one doc per commit) in `.full` durability mode —
 every commit must be on disk before the call returns. This is the
-workload group commit was designed for. Median of 5 runs, 1 s per
-sub-phase:
+workload group commit was designed for. 1 s per sub-phase:
 
 | Writers | commits/s | fsync avg | commits per fsync |
 |---------|----------:|----------:|------------------:|
-| 1       |  ~32 k    | 15 µs     | 1.00              |
-| 2       |  ~46 k    | 15 µs     | 1.00              |
-| 4       |  ~44 k    | 15 µs     | 1.00              |
-| 8       |  ~44 k    | 15 µs     | 1.00              |
+| 1       |   34 k    | 14.5 µs   | 1.00              |
+| 2       |   44 k    | 14.9 µs   | 1.00              |
+| 4       |   42 k    | 16.4 µs   | 1.00              |
+| 8       |   40 k    | 16.5 µs   | 1.00              |
 
-The 1.4× lift from W=1 to W=2 is the realised group-commit win —
+The 1.3× lift from W=1 to W=2 is the realised group-commit win —
 removing redundant fsyncs in the rare cases where a follower's
 `commitAppend` overlaps a leader's fsync. Past W=2 the curve flattens:
 on Apple M4 / APFS, fsync is **15 µs** and `db.mu` hold time
@@ -411,6 +410,46 @@ follower B traverses `db.mu` and reaches the fsync queue, leader A has
 already finished and reset `leader_active`. The protocol's diagnostic
 counters confirm this: `commits/fsync = 1.00` everywhere, and
 `follower_waits` is single-digit out of tens of thousands of commits.
+
+### Multi-writer OCC read-modify-write
+
+Phase D of `bench-concurrent`: N OCC writer threads, each doing
+`runOptimistic`-driven RMW against a 256-key hot pool — read a doc,
+increment its counter, write back. Every iteration captures a fresh
+snapshot, so this stresses the `Db.snapshot()` path:
+
+| Writers | commits/s | retry-budget exhausted |
+|---------|----------:|-----------------------:|
+| 1       |  3.4 k    | 0                      |
+| 2       |  3.9 k    | 0                      |
+| 4       |  3.6 k    | 0                      |
+| 8       |  3.2 k    | 0                      |
+
+Throughput plateaus around 3-4 k commits/s — `db.mu`-bound on the
+validate-and-apply phase (B+Tree CoW + index update for the
+single-key write). No conflicts in the budget exhaust the retry
+loop; the 256-key pool is loose enough that `WriteConflict` is
+rare and the runtime auto-retry hides it. With a tighter pool the
+conflict rate goes up sharply, demonstrating that the OCC mechanism
+is wired correctly.
+
+### Snapshot capture latency
+
+`zig build bench-snapshot` measures `Db.snapshot()` in three
+regimes — empty page cache, one commit's worth of dirty pages
+(steady state for tight OCC RMW), and a thousand commits' worth.
+Numbers in microseconds:
+
+| State                          | snapshot() |
+|--------------------------------|-----------:|
+| empty page cache               |   1.5 µs   |
+| 1-commit dirty cache           |  14   µs   |
+| 1000-commit dirty cache (rare) | 4.1 ms     |
+
+Capture is a soft-flush — pwrite the dirty page cache into the kernel
+page cache (where mmap reads from), without fsync or WAL truncate.
+Durability is still covered by the un-truncated WAL on crash recovery;
+fsync + WAL reset happen only on explicit `Db.checkpoint`.
 
 The structural ceiling at this concurrency is `db.mu`, not fsync.
 Group commit pays its way at W=2 and is harmless past that, but
