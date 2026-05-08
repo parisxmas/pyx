@@ -23,12 +23,16 @@
 //!                                    the free-page list, shared across
 //!                                    processes so freed pages are
 //!                                    visible to everyone)
-//!   bytes 72..4096 reserved
-//!
-//! Phase 2 will add a wal-index hash table after the header. Phase 3
-//! adds a reader-mark slot array. The 4 KB header reservation gives
-//! room for forward-compatible additions without bumping format
-//! versions for benign growth.
+//!   bytes 72..328  collections[16]  (sharding phase 2A; per-collection
+//!                                    state. Each slot is 16 bytes:
+//!                                    btree_root u32 | free_head u32 |
+//!                                    in_use u8 | _pad[7]. Slot 0 is
+//!                                    always in_use and mirrors the
+//!                                    top-level btree_root/free_head
+//!                                    fields above; phase 2B will start
+//!                                    actually routing per-id reads
+//!                                    through these slots.)
+//!   bytes 328..4096 reserved
 
 const std = @import("std");
 const Io = std.Io;
@@ -38,6 +42,27 @@ const Dir = Io.Dir;
 pub const shm_size: usize = 4096;
 pub const magic: [8]u8 = .{ 'P', 'Y', 'X', 'S', 'H', 'M', '0', '1' };
 pub const version: u32 = 1;
+
+/// Number of collection slots reserved in the shm header. Mirrors
+/// `pager.max_collections` (kept as a private constant here to avoid
+/// a circular module import).
+pub const max_collections: usize = 16;
+
+/// Per-collection state in shm. 16 bytes; the array of 16 fits in
+/// 256 bytes after the existing header fields.
+pub const CollectionSlot = extern struct {
+    /// Live B+Tree root for this collection. 0 means empty tree.
+    btree_root: u32 align(4),
+    /// Head of this collection's free-page list. 0 means empty.
+    free_head: u32 align(4),
+    /// Non-zero when the slot describes a real collection.
+    in_use: u8,
+    _pad: [7]u8,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(CollectionSlot) == 16);
+}
 
 pub const Error = error{
     NotAShm,
@@ -59,8 +84,9 @@ pub const Header = extern struct {
     writer_pid: u64 align(8),
     btree_root: u64 align(8),
     free_head: u64 align(8),
+    collections: [max_collections]CollectionSlot align(8),
     /// Pads the struct to 4096 bytes for forward compatibility.
-    _reserved: [shm_size - 72]u8,
+    _reserved: [shm_size - 72 - max_collections * 16]u8,
 };
 
 comptime {
@@ -72,6 +98,7 @@ comptime {
     std.debug.assert(@offsetOf(Header, "writer_pid") == 48);
     std.debug.assert(@offsetOf(Header, "btree_root") == 56);
     std.debug.assert(@offsetOf(Header, "free_head") == 64);
+    std.debug.assert(@offsetOf(Header, "collections") == 72);
 }
 
 pub const Shm = struct {
@@ -160,11 +187,40 @@ pub const Shm = struct {
         return @ptrCast(@alignCast(&self.header().free_head));
     }
 
+    /// Per-collection live B+Tree root (sharding phase 2).
+    pub fn collectionRoot(self: *Shm, id: usize) *std.atomic.Value(u32) {
+        std.debug.assert(id < max_collections);
+        return @ptrCast(@alignCast(&self.header().collections[id].btree_root));
+    }
+
+    /// Per-collection free-list head (sharding phase 2).
+    pub fn collectionFreeHead(self: *Shm, id: usize) *std.atomic.Value(u32) {
+        std.debug.assert(id < max_collections);
+        return @ptrCast(@alignCast(&self.header().collections[id].free_head));
+    }
+
+    /// Whether slot `id` describes a real collection. Slot 0 is always
+    /// true once the shm is initialised (it backs the default tree).
+    pub fn collectionInUse(self: *Shm, id: usize) bool {
+        std.debug.assert(id < max_collections);
+        return @atomicLoad(u8, &self.header().collections[id].in_use, .acquire) != 0;
+    }
+
+    pub fn setCollectionInUse(self: *Shm, id: usize, value: bool) void {
+        std.debug.assert(id < max_collections);
+        @atomicStore(u8, &self.header().collections[id].in_use, if (value) 1 else 0, .release);
+    }
+
     /// Seed every atomic counter from the values the on-disk DB header
     /// has at open time. Called by the first opener — phase 1 always
     /// calls it (single-process); phase 1C will gate it on the
     /// RECOVERY fcntl lock so only one process re-seeds across a
     /// multi-opener run.
+    ///
+    /// Phase 2A: slot 0 of the collections array is also seeded — it
+    /// mirrors the top-level btree_root/free_head and represents the
+    /// default collection. Other slots stay zero/unused until phase 2B
+    /// starts populating them.
     pub fn seedFromHeader(
         self: *Shm,
         next_doc_id: u64,
@@ -178,6 +234,9 @@ pub const Shm = struct {
         self.nextLsn().store(next_lsn, .release);
         self.btreeRoot().store(btree_root, .release);
         self.freeHead().store(free_head, .release);
+        self.collectionRoot(0).store(@intCast(btree_root), .release);
+        self.collectionFreeHead(0).store(@intCast(free_head), .release);
+        self.setCollectionInUse(0, true);
         // wal_end_offset is owned by Wal — set when the WAL is opened.
     }
 };
@@ -203,6 +262,28 @@ test "shm: open creates fresh header; reopen validates" {
         try testing.expectEqual(@as(u64, 42), shm.nextDocId().load(.acquire));
         try testing.expectEqual(@as(u64, 7), shm.numPages().load(.acquire));
     }
+}
+
+test "shm: seedFromHeader marks slot 0 in_use and mirrors root/free_head" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+
+    var shm = try Shm.open(io, tmp.dir, "slots.shm");
+    defer shm.close();
+
+    // Before seed: slot 0 not yet in_use, every higher slot likewise.
+    try testing.expect(!shm.collectionInUse(0));
+    try testing.expect(!shm.collectionInUse(7));
+
+    shm.seedFromHeader(1, 1, 1, 0xABC, 0xDEF);
+    try testing.expect(shm.collectionInUse(0));
+    try testing.expectEqual(@as(u32, 0xABC), shm.collectionRoot(0).load(.acquire));
+    try testing.expectEqual(@as(u32, 0xDEF), shm.collectionFreeHead(0).load(.acquire));
+    // Higher slots untouched — phase 2A only seeds the default.
+    try testing.expect(!shm.collectionInUse(1));
+    try testing.expect(!shm.collectionInUse(max_collections - 1));
+    try testing.expectEqual(@as(u32, 0), shm.collectionRoot(1).load(.acquire));
 }
 
 test "shm: rejects file with bad magic" {

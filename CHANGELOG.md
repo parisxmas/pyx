@@ -8,6 +8,21 @@ tag goes under `## Unreleased`.
 ## Unreleased
 
 ### Added
+- Keyspace sharding, phase 2A: `shm.zig` reserves a 16-slot
+  `collections[]` array (256 bytes after the existing fields, well
+  inside the 4 KB `-shm` reservation). Each slot carries a
+  per-collection `btree_root`, `free_head`, and `in_use` byte;
+  accessor methods (`collectionRoot`, `collectionFreeHead`,
+  `collectionInUse`, `setCollectionInUse`) wrap the atomic loads
+  and stores. `seedFromHeader` mirrors the top-level root/free_head
+  into slot 0 and marks it in-use, so the default tree always has
+  a valid slot. Pager.open also re-seeds slot 0 idempotently when
+  it sees a legacy shm (magic+version match, but `collections[]`
+  is still all zeros). Pure infrastructure — no public API change,
+  no behavioural change; phase 2B will start routing per-id reads
+  through these slots and adding the on-disk catalog that maps
+  collection name → id.
+
 - Keyspace sharding, phase 1: `pager.bTreeRoot` / `pager.setBTreeRoot`
   are now parameterized by `CollectionId` (typedef `u32`, with
   `default_collection_id = 0` reserved for today's single-tree state).

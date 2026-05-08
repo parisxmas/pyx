@@ -255,6 +255,14 @@ pub const Pager = struct {
                 @intCast(header.btree_root),
                 @intCast(header.free_head),
             );
+        } else if (!shm.collectionInUse(default_collection_id)) {
+            // Legacy shm from a pre-sharding pyx: the top-level fields
+            // are populated but the collections[] array is still all
+            // zeros. Mirror slot 0 from the live atomics so phase 2's
+            // per-id reads find the right root.
+            shm.collectionRoot(default_collection_id).store(@intCast(shm.btreeRoot().load(.acquire)), .release);
+            shm.collectionFreeHead(default_collection_id).store(@intCast(shm.freeHead().load(.acquire)), .release);
+            shm.setCollectionInUse(default_collection_id, true);
         }
 
         var wal = try wal_mod.Wal.open(allocator, io, dir, wal_path, shm.walEndOffset());
