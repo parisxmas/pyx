@@ -130,12 +130,17 @@ pub const Wal = struct {
             mem.writeInt(u32, hdr[12..16], 4096, .little);
             try file.writePositionalAll(io, &hdr, 0);
             try file.sync(io);
-            shm_end_offset.store(wal_header_size, .release);
+            // Fresh WAL file → write `wal_header_size` to shm
+            // unconditionally; if another process raced to be first
+            // opener and beat us with non-zero, prefer theirs.
+            const fresh_existing = shm_end_offset.load(.acquire);
+            const fresh_eo: u64 = if (fresh_existing == 0) wal_header_size else fresh_existing;
+            if (fresh_existing == 0) shm_end_offset.store(fresh_eo, .release);
             return .{
                 .allocator = allocator,
                 .io = io,
                 .file = file,
-                .end_offset = wal_header_size,
+                .end_offset = fresh_eo,
                 .pending = .empty,
                 .sync_mu = Io.Mutex.init,
                 .sync_cv = Io.Condition.init,
@@ -155,12 +160,19 @@ pub const Wal = struct {
         if (n < wal_header_size) return Error.TruncatedWal;
         if (!mem.eql(u8, hdr[0..8], &wal_magic)) return Error.NotAWal;
         if (mem.readInt(u32, hdr[8..12], .little) != wal_version) return Error.UnsupportedWal;
-        shm_end_offset.store(len, .release);
+        // Existing WAL file. If shm already has a live end_offset
+        // (another process is open), trust it — our `len` from
+        // `file.length` may lag a concurrent writer's pwrite.
+        // Otherwise (fresh shm, or this is the first opener), seed
+        // from the file length.
+        const existing = shm_end_offset.load(.acquire);
+        const eo: u64 = if (existing == 0) len else existing;
+        if (existing == 0) shm_end_offset.store(len, .release);
         return .{
             .allocator = allocator,
             .io = io,
             .file = file,
-            .end_offset = len,
+            .end_offset = eo,
             .pending = .empty,
             .sync_mu = Io.Mutex.init,
             .sync_cv = Io.Condition.init,

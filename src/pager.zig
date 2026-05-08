@@ -34,6 +34,13 @@ const ArrayList = std.ArrayList;
 
 const wal_mod = @import("wal.zig");
 const shm_mod = @import("shm.zig");
+const flock_mod = @import("flock.zig");
+
+// Byte regions for cross-process advisory locks. SQLite uses a similar
+// byte-array pattern; the bytes themselves don't need real data — they
+// just serve as namespaces for fcntl record locks.
+const writer_lock_region: flock_mod.Region = .{ .start = 0, .len = 1 };
+const recovery_lock_region: flock_mod.Region = .{ .start = 2, .len = 1 };
 
 pub const page_size: u32 = 4096;
 pub const PageId = u32;
@@ -204,14 +211,26 @@ pub const Pager = struct {
         var shm = try shm_mod.Shm.open(io, dir, shm_path);
         errdefer shm.close();
 
+        // Phase 1C: gate shm seeding on the RECOVERY fcntl lock. Try
+        // an exclusive non-blocking lock on the RECOVERY byte — if we
+        // get it, no other process has the DB open, so seeding the
+        // shm atomics from the on-disk header is safe. If we don't,
+        // someone else is already running and the shm has live state
+        // we must not clobber. Either way, downgrade to a shared lock
+        // for the lifetime of this open so future openers can detect
+        // us. Closing the file fd releases all our advisory locks
+        // automatically (per-process POSIX semantics).
+        const got_excl = flock_mod.tryLock(file.handle, .write, recovery_lock_region) catch false;
+        if (got_excl) {
+            shm.seedFromHeader(header.next_doc_id, header.num_pages, 1);
+        }
+        // Replace our (write or no) lock with shared. If the prior
+        // attempt succeeded, this downgrades exclusive→shared; if it
+        // failed, this takes shared from scratch.
+        flock_mod.lock(file.handle, .read, recovery_lock_region) catch {};
+
         var wal = try wal_mod.Wal.open(allocator, io, dir, wal_path, shm.walEndOffset());
         errdefer wal.close();
-
-        // Phase 1B: seed from the on-disk header. With only one process
-        // opening the DB this is correct. Phase 1C will gate re-seeding
-        // on the RECOVERY fcntl lock so concurrent openers don't
-        // clobber each other's atomics.
-        shm.seedFromHeader(header.next_doc_id, header.num_pages, 1);
 
         return .{
             .allocator = allocator,
@@ -334,6 +353,18 @@ pub const Pager = struct {
 
     pub fn begin(self: *Pager) !void {
         if (self.in_txn) return Error.TxnAlreadyActive;
+        // Cross-process WRITER lock — held for the entire txn so only
+        // one process is mutating the DB at a time. In-process callers
+        // are already serialised by `db.mu`; this is the
+        // cross-process equivalent. Skipped during recovery (we hold
+        // the lock from open-time and don't want to block replay).
+        if (!self.in_recovery) {
+            try flock_mod.lock(self.file.handle, .write, writer_lock_region);
+        }
+        errdefer if (!self.in_recovery) {
+            flock_mod.unlock(self.file.handle, writer_lock_region) catch {};
+        };
+
         // Capture the live page count from shm so abort can restore it
         // — `txn_header_snapshot.num_pages` is now the pre-txn shm
         // value, not the (possibly stale) on-disk header value.
@@ -457,6 +488,12 @@ pub const Pager = struct {
         self.txn_append_hint = null;
         self.header_dirty = false;
         self.in_txn = false;
+        // Release the cross-process WRITER lock now that the txn's
+        // shm mutations are complete. Other processes blocked in
+        // `pager.begin` will see them via the shared mmap.
+        if (!self.in_recovery) {
+            flock_mod.unlock(self.file.handle, writer_lock_region) catch {};
+        }
     }
 
     pub fn abort(self: *Pager) void {
@@ -467,12 +504,14 @@ pub const Pager = struct {
         self.txn_append_hint = null;
         self.header = self.txn_header_snapshot;
         // Roll the live page counter back so aborted txns don't leak
-        // page ids — matches pre-shm behaviour. Safe to do without
-        // coordination here because we're inside a single in-process
-        // txn (pre-1C) or holding the WRITER lock (1C+).
+        // page ids — matches pre-shm behaviour. Safe under the WRITER
+        // fcntl lock: only this process is in the critical section.
         self.shm.numPages().store(self.txn_header_snapshot.num_pages, .release);
         self.header_dirty = false;
         self.in_txn = false;
+        if (!self.in_recovery) {
+            flock_mod.unlock(self.file.handle, writer_lock_region) catch {};
+        }
     }
 
     pub fn recordPut(self: *Pager, key: []const u8, value: []const u8) !void {

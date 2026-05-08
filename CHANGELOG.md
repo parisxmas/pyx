@@ -25,12 +25,30 @@ tag goes under `## Unreleased`.
   404. The template-language constraint that variable names can't
   start with `_` led to renaming the dict's `_id` key to `doc_id`
   in views and templates.
-- Multi-process foundation, phase 1C (in progress): `src/flock.zig`
-  introduces a thin POSIX byte-range advisory-lock wrapper around
-  `fcntl(F_SETLK / F_SETLKW)` — `lock` (blocking), `tryLock`
-  (non-blocking → bool), `unlock`. Module ships standalone with
-  self-tests; the Pager-side wiring (WRITER lock around commit,
-  RECOVERY lock for first-opener seed) is the next step.
+- Multi-process foundation, phase 1C: `src/flock.zig` POSIX byte-
+  range advisory-lock wrapper, plus the Pager-side wiring:
+  - WRITER lock (byte 0 of the data file) around `pager.begin` →
+    `applyAndFinalize`/`abort`. One process at a time enters the
+    commit pipeline across the whole machine.
+  - RECOVERY lock (byte 2): on open, try non-blocking exclusive.
+    If we get it, we're alone — seed shm from the on-disk header.
+    Then downgrade to shared. If exclusive fails, another process
+    is open; trust the live shm values. POSIX semantics release the
+    locks on file-close.
+  - Wal.open now reads the shm `walEndOffset` and trusts a non-zero
+    value over its own local `file.length` read — so a fresh opener
+    doesn't clobber an in-flight writer's append cursor.
+  - **NOT yet sufficient for cross-process data preservation.**
+    `header.btree_root` and the in-memory `page_cache` are still
+    per-process: each process's commit updates its OWN btree_root
+    (in-process), and `close`'s checkpoint writes that header to
+    disk. If two processes commit and close, the last closer's
+    btree_root overwrites the earlier one — earlier writes are lost.
+    Phase 2 (wal-index in shm) is what makes cross-process writes
+    actually durable. Until then, the multi-process safety story is
+    "WAL appends won't corrupt and counters won't collide, but
+    visibility across processes is still single-writer." The Django
+    example's "single-process only" caveat stands.
 - Multi-process foundation, phase 1B: the remaining three runtime
   counters move to shm — `num_pages`, `next_lsn`, and
   `wal.end_offset`. `Wal.open` takes the shm-resident
