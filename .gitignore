@@ -28,3 +28,7 @@ venv/
 bindings/python/pyx/libpyx.dylib
 bindings/python/pyx/libpyx.so
 bindings/python/pyx/pyx.dll
+
+# Compiled C extension (phase 5B `pyx._native`) — built per-platform/python
+bindings/python/pyx/_native*.so
+bindings/python/pyx/_native*.pyd
