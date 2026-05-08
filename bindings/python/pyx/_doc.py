@@ -175,7 +175,29 @@ def _write_value_payload(buf: bytearray, tag: int, value) -> None:
 
 # -------- decode --------
 
+try:
+    from . import _native as _native_mod  # type: ignore
+    _decode_native = _native_mod.decode
+except ImportError:
+    _decode_native = None  # extension unavailable; fall through to Python
+
+
 def decode(data: bytes) -> dict:
+    if _decode_native is not None:
+        return _decode_native(data)
+    if len(data) < 1:
+        raise ValueError("truncated document")
+    if data[0] != TAG_OBJECT:
+        raise ValueError("top-level must be object")
+    val, _ = _read_value(data, 0)
+    if not isinstance(val, dict):
+        raise ValueError("top-level must be object (dict)")
+    return val
+
+
+def _decode_pure_python(data: bytes) -> dict:
+    """The pure-Python fallback. Kept callable for tests/benchmarks
+    even when the native extension is loaded."""
     if len(data) < 1:
         raise ValueError("truncated document")
     if data[0] != TAG_OBJECT:

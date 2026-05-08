@@ -21,7 +21,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from setuptools import Distribution, setup
+from setuptools import Distribution, Extension, setup
 from setuptools.command.build_py import build_py
 
 
@@ -121,21 +121,20 @@ class BinaryDistribution(Distribution):
         return True
 
 
-try:
-    from wheel.bdist_wheel import bdist_wheel as _bdist_wheel  # type: ignore
+# Phase 5B: ship a Python C extension (`pyx._native`) that does
+# native document decoding. `optional=True` lets the wheel still
+# build if the C compiler is unavailable — the binding falls back
+# to the pure-Python `_doc.decode` at import time.
+NATIVE_EXT = Extension(
+    name="pyx._native",
+    sources=["pyx/_native.c"],
+    extra_compile_args=["-O3"],
+    optional=True,
+)
 
-    class BdistWheel(_bdist_wheel):
-        def get_tag(self):
-            # ABI: `none` because the binding is ctypes-only — there is no
-            # Python C-ABI dependency, so one wheel works for every
-            # CPython 3.x and PyPy on the matching platform. Platform tag
-            # comes from `has_ext_modules() == True` above.
-            _, _, plat = super().get_tag()
-            return "py3", "none", plat
+# With a real C extension the wheel tag is now Python-version-specific
+# (`cp3xx-cp3xx-plat`), driven by setuptools' default `bdist_wheel`.
+# We don't override `get_tag` anymore — the override was only correct
+# while the binding was pure-ctypes, which is no longer true.
 
-    cmdclass["bdist_wheel"] = BdistWheel
-except ImportError:
-    pass
-
-
-setup(cmdclass=cmdclass, distclass=BinaryDistribution)
+setup(cmdclass=cmdclass, distclass=BinaryDistribution, ext_modules=[NATIVE_EXT])

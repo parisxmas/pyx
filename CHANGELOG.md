@@ -34,13 +34,45 @@ tag goes under `## Unreleased`.
   effect on the bench docs (which have few numeric fields), but
   still strictly faster.
 
-- Phase 5B (native decode) is **NOT included**. The current ctypes
-  binding can't return Python objects from C without a proper
-  Python C extension (.so), which is a separate build-system
-  change. Once the random-read workload starts mattering enough
-  to justify it, the path is: drop ctypes, write a thin C
-  extension that calls libpyx and uses the Python C API to
-  build dicts directly. Defer until users hit it.
+- Phase 5B: **native document decode**. New Python C extension
+  `pyx._native` (sources at `bindings/python/pyx/_native.c`)
+  that replaces `_doc.decode` and the per-value decode loop in
+  `Collection.get_many` with a tight C parser that builds
+  `dict`/`list`/`int`/`float`/`str`/`bytes` directly via the
+  Python C API — no Python-level interpreter loop on the hot
+  path. Two functions exported:
+
+      _native.decode(buf)               -> dict
+      _native.decode_many(buf, lens, ids) -> dict[int, dict]
+
+  The `decode_many` path lets `Collection.get_many` skip the
+  Python-side unpacking entirely: pyx_get_many populates the
+  shared `out_buf` + `out_lens` ctypes arrays, the C extension
+  walks them once and returns the finished dict.
+
+  Build is wired into `bindings/python/setup.py` as a setuptools
+  `Extension` with `optional=True` — if the C compiler isn't
+  available, the wheel still builds and the binding falls back
+  to the pure-Python `_doc.decode` at import time. The old
+  `BdistWheel.get_tag` override (which forced `py3-none`) is
+  gone; setuptools now picks the right Python-version-specific
+  tag because the package has a real C extension.
+
+  Bench (20k random reads against 10k-doc tree):
+
+      loop  c.get(id):                       332 kops/s   (was 212 — +56%)
+      batch c.get_many(256):               1538 kops/s   (was 580 — +165%)
+      batch c.get_many(1024):              1602 kops/s   (was 549 — +192%)
+      batch c.get_many(4096):              1775 kops/s   (was 685 — +159%)
+
+  Side-by-side vs SQLite at batch=256:
+
+      pyx     1.54 Mops/s
+      sqlite  2.31 Mops/s
+      ratio   0.67x   (was 0.24x with phase 5A only)
+
+  41 existing Python tests still pass; pure-Python decode round-trip
+  matches native decode byte-for-byte across the test corpus.
 
 - Phase 4 of the post-0.4.0 work: **batched-get API**.
   `Collection.get_many(ids) -> {id: doc}` issues one ctypes call

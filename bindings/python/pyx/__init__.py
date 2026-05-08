@@ -21,6 +21,10 @@ import random
 import time
 
 from . import _doc, _ffi
+try:
+    from . import _native as _native_mod  # type: ignore
+except ImportError:
+    _native_mod = None
 from .errors import (
     PyxError,
     RetryBudgetExhausted,
@@ -414,9 +418,12 @@ class Collection:
         else:
             raise RuntimeError("pyx_get_many: buffer-too-small loop did not converge")
         # Decode: values are packed in ids[] order; out_lens[i] = 0 for misses.
+        # When the C extension (phase 5B) is available, do the entire
+        # decode loop in C so we never enter Python-level decode at all.
+        if _native_mod is not None:
+            return _native_mod.decode_many(out_buf, out_lens, ids)
         result: dict[int, dict] = {}
         offset = 0
-        # Slice once into a memoryview to avoid per-iteration ctypes indexing.
         mv = memoryview(out_buf).cast("B")
         for i in range(n):
             ln = out_lens[i]
