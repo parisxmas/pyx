@@ -33,6 +33,7 @@ const AutoHashMapUnmanaged = std.AutoHashMapUnmanaged;
 const ArrayList = std.ArrayList;
 
 const wal_mod = @import("wal.zig");
+const shm_mod = @import("shm.zig");
 
 pub const page_size: u32 = 4096;
 pub const PageId = u32;
@@ -161,12 +162,13 @@ pub const Pager = struct {
     txn_append_hint: ?PageId,
     next_lsn: u64,
     sync_mode: SyncMode,
-    /// Lock-free doc-id allocator used by OCC writers that don't hold the
-    /// data lock. Initialised from `header.next_doc_id` at open and
-    /// after WAL replay; the on-disk header is brought back into sync at
-    /// the start of every `commitAppend` so the COMMIT record reflects
-    /// every reservation made before the commit.
-    next_doc_id_atomic: std.atomic.Value(u64),
+    /// Cross-process shared-memory file. Phase 1A places the
+    /// `next_doc_id` atomic counter here so any process that opens the
+    /// same DB sees a single source of truth for ID allocation. Phase
+    /// 1B will move `num_pages`, `next_lsn`, and `wal.end_offset`;
+    /// phase 1C adds the fcntl WRITER lock. Multi-reader visibility
+    /// (wal-index) lands in phase 2.
+    shm: shm_mod.Shm,
 
     pub fn open(allocator: Allocator, io: Io, dir: Dir, sub_path: []const u8) !Pager {
         const file = try dir.createFile(io, sub_path, .{
@@ -180,6 +182,8 @@ pub const Pager = struct {
 
         const wal_path = try mem.concat(allocator, u8, &.{ sub_path, ".wal" });
         defer allocator.free(wal_path);
+        const shm_path = try mem.concat(allocator, u8, &.{ sub_path, "-shm" });
+        defer allocator.free(shm_path);
 
         if (fresh) {
             var hbuf: [page_size]u8 = undefined;
@@ -187,6 +191,7 @@ pub const Pager = struct {
             try file.writePositionalAll(io, &hbuf, 0);
             try file.sync(io);
             dir.deleteFile(io, wal_path) catch {};
+            dir.deleteFile(io, shm_path) catch {};
         } else if (file_len < page_size) {
             return Error.TruncatedFile;
         }
@@ -198,6 +203,19 @@ pub const Pager = struct {
         const n = try file.readPositionalAll(io, &hdr_buf, 0);
         if (n < page_size) return Error.TruncatedFile;
         const header = try deserializeHeader(&hdr_buf);
+
+        var shm = try shm_mod.Shm.open(io, dir, shm_path);
+        errdefer shm.close();
+        // Phase 1A: always seed from the on-disk header. With only one
+        // process opening the DB this is correct. Phase 1C will gate
+        // re-seeding on the RECOVERY fcntl lock so multiple openers
+        // don't clobber each other's atomics.
+        shm.seedFromHeader(
+            header.next_doc_id,
+            header.num_pages,
+            1, // next_lsn placeholder; phase 1B moves the real value here
+            wal.end_offset,
+        );
 
         return .{
             .allocator = allocator,
@@ -216,7 +234,7 @@ pub const Pager = struct {
             .txn_append_hint = null,
             .next_lsn = 1,
             .sync_mode = .full,
-            .next_doc_id_atomic = .init(header.next_doc_id),
+            .shm = shm,
         };
     }
 
@@ -237,6 +255,7 @@ pub const Pager = struct {
         self.pending.deinit(self.allocator);
         self.txn_arena.deinit();
         self.wal.close();
+        self.shm.close();
         self.file.close(self.io);
         self.* = undefined;
     }
@@ -357,7 +376,7 @@ pub const Pager = struct {
         // Bring the in-memory header up to whatever doc-id reservations
         // happened concurrently via `reserveDocId` (used by lock-free OCC
         // writers). This is a load-and-bump on the atomic; no contention.
-        const reserved = self.next_doc_id_atomic.load(.monotonic);
+        const reserved = self.shm.nextDocId().load(.monotonic);
         if (reserved > self.header.next_doc_id) {
             self.header.next_doc_id = reserved;
             self.header_dirty = true;
@@ -571,7 +590,7 @@ pub const Pager = struct {
     }
 
     pub fn nextDocId(self: *Pager) !u64 {
-        const id = self.next_doc_id_atomic.fetchAdd(1, .monotonic);
+        const id = self.shm.nextDocId().fetchAdd(1, .monotonic);
         if (self.in_txn) {
             // Header sync is handled by commitAppend — leaving the
             // header field stale here is fine and avoids redundant
@@ -590,8 +609,11 @@ pub const Pager = struct {
     /// commit), so a crash before that commit drops the reservation —
     /// acceptable, since the OCC txn would also have lost its
     /// uncommitted writes.
+    ///
+    /// Backed by the shm-resident counter as of phase 1A, so concurrent
+    /// processes (once phase 1C lands the WRITER lock) won't collide.
     pub fn reserveDocId(self: *Pager) u64 {
-        return self.next_doc_id_atomic.fetchAdd(1, .monotonic);
+        return self.shm.nextDocId().fetchAdd(1, .monotonic);
     }
 
     pub fn restoreNextDocId(self: *Pager, value: u64) void {
@@ -599,17 +621,13 @@ pub const Pager = struct {
             self.header.next_doc_id = value;
             self.header_dirty = true;
         }
-        // Keep the atomic counter in sync with replayed state so any
+        // Keep the shared atomic in sync with replayed state so any
         // post-replay reservation outranks the recovered value.
+        const atomic = self.shm.nextDocId();
         while (true) {
-            const cur = self.next_doc_id_atomic.load(.monotonic);
+            const cur = atomic.load(.monotonic);
             if (cur >= value) break;
-            if (self.next_doc_id_atomic.cmpxchgWeak(
-                cur,
-                value,
-                .monotonic,
-                .monotonic,
-            ) == null) break;
+            if (atomic.cmpxchgWeak(cur, value, .monotonic, .monotonic) == null) break;
         }
     }
 
