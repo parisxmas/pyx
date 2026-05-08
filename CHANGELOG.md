@@ -8,6 +8,15 @@ tag goes under `## Unreleased`.
 ## Unreleased
 
 ### Added
+- Compound indexes (Zig core, phase 1 of 3): `Db.createCompoundIndex`,
+  `Db.dropCompoundIndex`, `Collection.findOneCompound`. The index is
+  ordered — `(last, first)` is a different index from `(first, last)`
+  and only the former answers a `last + first` lookup. Auto-maintained
+  on insert / put / delete; persisted in two new namespaces (\x03 for
+  the registry, \x04 for entries) so existing single-field indexes are
+  unaffected. v1 limits: equality-only, no range on the trailing
+  field, max 16 fields per index. C ABI + Python bindings + OCC
+  range-set tracking land in phases 2 and 3.
 - `Pager.flushForSnapshot` — soft-flush variant that pwrites the dirty
   page cache into the kernel page cache without fsync or WAL truncate.
   `Db.snapshot()` uses it instead of `checkpoint`, dropping snapshot

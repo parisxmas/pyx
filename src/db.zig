@@ -416,6 +416,47 @@ pub const Db = struct {
         };
         try self.pager.syncTo(commit_lsn);
     }
+
+    /// Create a compound (multi-field) index. The field order matters —
+    /// `(last, first)` is a different index from `(first, last)` and
+    /// only the former answers `last="X" AND first="Y"` lookups.
+    pub fn createCompoundIndex(self: *Db, coll: []const u8, fields: []const []const u8) !void {
+        try validateName(coll);
+        if (self.ownsTxn()) {
+            try self.indexes.createCompoundIndex(&self.pager, coll, fields);
+            return;
+        }
+        const commit_lsn = blk: {
+            self.mu.lockUncancelable(self.pager.io);
+            defer self.mu.unlock(self.pager.io);
+            try self.pager.begin();
+            errdefer self.pager.abort();
+            try self.indexes.createCompoundIndex(&self.pager, coll, fields);
+            const lsn = try self.pager.commitAppend();
+            try self.pager.applyAndFinalize();
+            break :blk lsn;
+        };
+        try self.pager.syncTo(commit_lsn);
+    }
+
+    pub fn dropCompoundIndex(self: *Db, coll: []const u8, fields: []const []const u8) !void {
+        try validateName(coll);
+        if (self.ownsTxn()) {
+            try self.indexes.dropCompoundIndex(&self.pager, coll, fields);
+            return;
+        }
+        const commit_lsn = blk: {
+            self.mu.lockUncancelable(self.pager.io);
+            defer self.mu.unlock(self.pager.io);
+            try self.pager.begin();
+            errdefer self.pager.abort();
+            try self.indexes.dropCompoundIndex(&self.pager, coll, fields);
+            const lsn = try self.pager.commitAppend();
+            try self.pager.applyAndFinalize();
+            break :blk lsn;
+        };
+        try self.pager.syncTo(commit_lsn);
+    }
 };
 
 pub const Collection = struct {
@@ -551,6 +592,24 @@ pub const Collection = struct {
         if (locked) self.db.mu.lockUncancelable(self.db.pager.io);
         defer if (locked) self.db.mu.unlock(self.db.pager.io);
         return self.db.indexes.findOne(&self.db.pager, self.name, field_path, value) catch |err| switch (err) {
+            error.NoSuchIndex => Error.NoSuchIndex,
+            else => err,
+        };
+    }
+
+    /// Compound-index equality lookup. `fields` and `values` must align
+    /// in order with the index's registered field list — `(last, first)`
+    /// is a different index from `(first, last)`.
+    pub fn findOneCompound(
+        self: Collection,
+        fields: []const []const u8,
+        values: []const doc_mod.Value,
+    ) !?u64 {
+        try validateName(self.name);
+        const locked = !self.db.ownsTxn();
+        if (locked) self.db.mu.lockUncancelable(self.db.pager.io);
+        defer if (locked) self.db.mu.unlock(self.db.pager.io);
+        return self.db.indexes.findOneCompound(&self.db.pager, self.name, fields, values) catch |err| switch (err) {
             error.NoSuchIndex => Error.NoSuchIndex,
             else => err,
         };
@@ -2821,4 +2880,211 @@ test "OptimisticTxn: iterator + concurrent delete in observed prefix → conflic
     _ = try db.collection("c").delete(id_a);
 
     try testing.expectError(Error.WriteConflict, txn.commit());
+}
+
+test "compound index: create + insert + findOne + drop" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "compound.db");
+    defer db.close();
+
+    // Build a doc with both `last` and `first`.
+    const alice_smith = blk: {
+        var b = Builder.init(ally);
+        defer b.deinit();
+        try b.beginDocument();
+        try b.putString("last", "smith");
+        try b.putString("first", "alice");
+        try b.endDocument();
+        break :blk try b.finish();
+    };
+    defer ally.free(alice_smith);
+    const bob_smith = blk: {
+        var b = Builder.init(ally);
+        defer b.deinit();
+        try b.beginDocument();
+        try b.putString("last", "smith");
+        try b.putString("first", "bob");
+        try b.endDocument();
+        break :blk try b.finish();
+    };
+    defer ally.free(bob_smith);
+
+    const users = db.collection("users");
+    const id_a = try users.insert(alice_smith);
+    const id_b = try users.insert(bob_smith);
+
+    try db.createCompoundIndex("users", &.{ "last", "first" });
+
+    const got_a = try users.findOneCompound(
+        &.{ "last", "first" },
+        &.{ .{ .string = "smith" }, .{ .string = "alice" } },
+    );
+    try testing.expectEqual(@as(?u64, id_a), got_a);
+
+    const got_b = try users.findOneCompound(
+        &.{ "last", "first" },
+        &.{ .{ .string = "smith" }, .{ .string = "bob" } },
+    );
+    try testing.expectEqual(@as(?u64, id_b), got_b);
+
+    // Wrong field order is a different (unregistered) index.
+    try testing.expectError(Error.NoSuchIndex, users.findOneCompound(
+        &.{ "first", "last" },
+        &.{ .{ .string = "alice" }, .{ .string = "smith" } },
+    ));
+
+    // No-such-tuple lookup returns null (still uses the same index).
+    const nope = try users.findOneCompound(
+        &.{ "last", "first" },
+        &.{ .{ .string = "smith" }, .{ .string = "carol" } },
+    );
+    try testing.expect(nope == null);
+
+    try db.dropCompoundIndex("users", &.{ "last", "first" });
+    try testing.expectError(Error.NoSuchIndex, users.findOneCompound(
+        &.{ "last", "first" },
+        &.{ .{ .string = "smith" }, .{ .string = "alice" } },
+    ));
+}
+
+test "compound index: auto-maintained on insert / put / delete" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "compound-auto.db");
+    defer db.close();
+
+    try db.createCompoundIndex("c", &.{ "last", "first" });
+
+    const make = struct {
+        fn make(allocator: std.mem.Allocator, last: []const u8, first: []const u8) ![]u8 {
+            var b = Builder.init(allocator);
+            defer b.deinit();
+            try b.beginDocument();
+            try b.putString("last", last);
+            try b.putString("first", first);
+            try b.endDocument();
+            return try b.finish();
+        }
+    }.make;
+
+    const c = db.collection("c");
+    const a1 = try make(ally, "smith", "alice");
+    defer ally.free(a1);
+    const id = try c.insert(a1);
+
+    const fields = &[_][]const u8{ "last", "first" };
+    try testing.expectEqual(@as(?u64, id), try c.findOneCompound(
+        fields,
+        &.{ .{ .string = "smith" }, .{ .string = "alice" } },
+    ));
+
+    // put → old (smith, alice) entry removed; new (jones, alicia) added.
+    const a2 = try make(ally, "jones", "alicia");
+    defer ally.free(a2);
+    try c.put(id, a2);
+    try testing.expect((try c.findOneCompound(
+        fields,
+        &.{ .{ .string = "smith" }, .{ .string = "alice" } },
+    )) == null);
+    try testing.expectEqual(@as(?u64, id), try c.findOneCompound(
+        fields,
+        &.{ .{ .string = "jones" }, .{ .string = "alicia" } },
+    ));
+
+    // delete → entry gone.
+    _ = try c.delete(id);
+    try testing.expect((try c.findOneCompound(
+        fields,
+        &.{ .{ .string = "jones" }, .{ .string = "alicia" } },
+    )) == null);
+}
+
+test "compound index: reopen restores definition and entries" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    const io = testing.io;
+
+    var saved_id: u64 = undefined;
+    {
+        var db = try Db.open(ally, io, tmp.dir, "compound-reopen.db");
+        defer db.close();
+        try db.createCompoundIndex("c", &.{ "last", "first" });
+
+        var b = Builder.init(ally);
+        defer b.deinit();
+        try b.beginDocument();
+        try b.putString("last", "smith");
+        try b.putString("first", "alice");
+        try b.endDocument();
+        const bytes = try b.finish();
+        defer ally.free(bytes);
+        saved_id = try db.collection("c").insert(bytes);
+        try db.checkpoint();
+    }
+    {
+        var db = try Db.open(ally, io, tmp.dir, "compound-reopen.db");
+        defer db.close();
+        const got = try db.collection("c").findOneCompound(
+            &.{ "last", "first" },
+            &.{ .{ .string = "smith" }, .{ .string = "alice" } },
+        );
+        try testing.expectEqual(@as(?u64, saved_id), got);
+    }
+}
+
+test "compound index: build-while-scan picks up pre-existing docs" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "compound-build.db");
+    defer db.close();
+
+    const make = struct {
+        fn make(allocator: std.mem.Allocator, last: []const u8, first: []const u8) ![]u8 {
+            var b = Builder.init(allocator);
+            defer b.deinit();
+            try b.beginDocument();
+            try b.putString("last", last);
+            try b.putString("first", first);
+            try b.endDocument();
+            return try b.finish();
+        }
+    }.make;
+
+    const c = db.collection("c");
+    var ids: [3]u64 = undefined;
+    {
+        const x = try make(ally, "smith", "a");
+        defer ally.free(x);
+        ids[0] = try c.insert(x);
+    }
+    {
+        const x = try make(ally, "smith", "b");
+        defer ally.free(x);
+        ids[1] = try c.insert(x);
+    }
+    {
+        const x = try make(ally, "jones", "c");
+        defer ally.free(x);
+        ids[2] = try c.insert(x);
+    }
+
+    try db.createCompoundIndex("c", &.{ "last", "first" });
+
+    try testing.expectEqual(@as(?u64, ids[0]), try c.findOneCompound(
+        &.{ "last", "first" },
+        &.{ .{ .string = "smith" }, .{ .string = "a" } },
+    ));
+    try testing.expectEqual(@as(?u64, ids[1]), try c.findOneCompound(
+        &.{ "last", "first" },
+        &.{ .{ .string = "smith" }, .{ .string = "b" } },
+    ));
+    try testing.expectEqual(@as(?u64, ids[2]), try c.findOneCompound(
+        &.{ "last", "first" },
+        &.{ .{ .string = "jones" }, .{ .string = "c" } },
+    ));
 }
