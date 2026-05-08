@@ -8,6 +8,40 @@ tag goes under `## Unreleased`.
 ## Unreleased
 
 ### Added
+- Phase 5A: **sorted-scan in `Collection.getMany`**. Above 128 ids per
+  call the implementation sorts the input ids, opens a single
+  iterator at the smallest id's encoded key, and walks forward
+  through the leaves matching against remaining sought ids — one
+  descent + one leaf-chain walk instead of N independent descents.
+  Bounded by the collection's primary-key prefix so it never wanders
+  into index pages or the catalog. Below 128 ids the descent path
+  still wins (random ids spread across the tree force the iterator
+  to skip too many entries between matches), so `getMany` picks
+  between `getManyDescents` and `getManySorted` based on
+  `ids.len < 128`. Threshold is empirical; re-tune for differently
+  shaped trees.
+
+  Bench (20k random reads against 10k-doc tree):
+
+      batch=  16    63.4 ms    315 k/s   1.54x  (descent path)
+      batch=  64    61.2 ms    326 k/s   1.60x  (descent path)
+      batch= 256    34.5 ms    580 k/s   1.94x  (sorted-scan)
+      batch=1024    36.4 ms    549 k/s   2.68x  (sorted-scan)
+      batch=4096    29.2 ms    685 k/s   3.35x  (sorted-scan)
+
+  Also a small `_doc.py` micro-opt — pre-compiled `struct.Struct`
+  unpackers for i64/f64/u32 instead of `int.from_bytes`. Marginal
+  effect on the bench docs (which have few numeric fields), but
+  still strictly faster.
+
+- Phase 5B (native decode) is **NOT included**. The current ctypes
+  binding can't return Python objects from C without a proper
+  Python C extension (.so), which is a separate build-system
+  change. Once the random-read workload starts mattering enough
+  to justify it, the path is: drop ctypes, write a thin C
+  extension that calls libpyx and uses the Python C API to
+  build dicts directly. Defer until users hit it.
+
 - Phase 4 of the post-0.4.0 work: **batched-get API**.
   `Collection.get_many(ids) -> {id: doc}` issues one ctypes call
   for any number of doc ids and decodes the results in input

@@ -23,6 +23,13 @@ from __future__ import annotations
 
 import struct
 
+# Precompiled struct unpackers — `Struct(...)`.unpack_from is several
+# times faster than `int.from_bytes(buf[pos:pos+8], "little")` on
+# CPython because it skips the slice + the Python-level conversion.
+_UNPACK_I64 = struct.Struct("<q").unpack_from
+_UNPACK_F64 = struct.Struct("<d").unpack_from
+_UNPACK_U32 = struct.Struct("<I").unpack_from
+
 TAG_NULL = 0
 TAG_FALSE = 1
 TAG_TRUE = 2
@@ -197,12 +204,12 @@ def _read_payload(buf: bytes, pos: int, tag: int) -> tuple[object, int]:
     if tag == TAG_I64:
         if pos + 8 > len(buf):
             raise ValueError("truncated i64")
-        n = int.from_bytes(buf[pos : pos + 8], "little", signed=True)
+        (n,) = _UNPACK_I64(buf, pos)
         return n, pos + 8
     if tag == TAG_F64:
         if pos + 8 > len(buf):
             raise ValueError("truncated f64")
-        (f,) = struct.unpack_from("<d", buf, pos)
+        (f,) = _UNPACK_F64(buf, pos)
         return f, pos + 8
     if tag == TAG_STRING:
         n, pos = _read_varint(buf, pos)
@@ -219,7 +226,7 @@ def _read_payload(buf: bytes, pos: int, tag: int) -> tuple[object, int]:
     if tag == TAG_ARRAY:
         if pos + 4 > len(buf):
             raise ValueError("truncated array length")
-        body_len = int.from_bytes(buf[pos : pos + 4], "little")
+        (body_len,) = _UNPACK_U32(buf, pos)
         pos += 4
         end = pos + body_len
         if end > len(buf):

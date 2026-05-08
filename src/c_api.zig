@@ -394,38 +394,29 @@ export fn pyx_get_many(
     if (n_ids == 0) return status_ok;
     const ids_ptr = ids orelse return status_invalid_arg;
     const lens_ptr = out_lens orelse return status_invalid_arg;
-    const buf_ptr = out_buf;
+    const buf_ptr = out_buf orelse return status_invalid_arg;
 
     const collection = s.db.collection(c);
-    var offset: usize = 0;
-    var overflowed = false;
-
-    var i: usize = 0;
-    while (i < n_ids) : (i += 1) {
-        const result = collection.get(s.allocator, ids_ptr[i]) catch |err| {
+    var used: usize = 0;
+    const ok = collection.getMany(
+        s.allocator,
+        ids_ptr[0..n_ids],
+        lens_ptr[0..n_ids],
+        buf_ptr[0..out_buf_cap],
+        &used,
+    ) catch |err| switch (err) {
+        error.BufferTooSmall => {
+            if (out_buf_used) |p| p.* = used;
+            return status_buffer_too_small;
+        },
+        else => {
             setLastError("pyx_get_many: {t}", .{err});
             return statusFromError(err);
-        };
-        if (result) |bytes| {
-            defer s.allocator.free(bytes);
-            if (overflowed or offset + bytes.len > out_buf_cap) {
-                // Past the buffer — keep tallying the total required size.
-                offset += bytes.len;
-                overflowed = true;
-                lens_ptr[i] = 0;
-                continue;
-            }
-            const dst = buf_ptr orelse return status_invalid_arg;
-            @memcpy(dst[offset..][0..bytes.len], bytes);
-            lens_ptr[i] = @intCast(bytes.len);
-            offset += bytes.len;
-        } else {
-            lens_ptr[i] = 0;
-        }
-    }
-
-    if (out_buf_used) |p| p.* = offset;
-    return if (overflowed) status_buffer_too_small else status_ok;
+        },
+    };
+    _ = ok;
+    if (out_buf_used) |p| p.* = used;
+    return status_ok;
 }
 
 export fn pyx_delete(

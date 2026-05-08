@@ -87,7 +87,7 @@ fn internalEntrySize(key_len: usize) usize {
     return 6 + key_len;
 }
 
-const LeafEntry = struct { key: []const u8, value: []const u8 };
+pub const LeafEntry = struct { key: []const u8, value: []const u8 };
 
 fn readLeafEntry(page: *const [page_size]u8, offset: u16) LeafEntry {
     const key_len = mem.readInt(u16, page[offset..][0..2], .little);

@@ -45,6 +45,11 @@ pub const Error = error{
     /// Returned by `Db.runOptimistic` when the retry budget is
     /// exhausted without a successful commit.
     RetryBudgetExhausted,
+    /// Returned by `Collection.getMany` when the caller's output
+    /// buffer can't fit the values for every found id. The
+    /// `out_buf_used` out-parameter is set to the required size so
+    /// the caller can retry with a larger buffer.
+    BufferTooSmall,
 };
 
 const max_prefix_size: usize = 1 + 10 + max_collection_name; // namespace + varint + name
@@ -700,6 +705,186 @@ pub const Collection = struct {
         var key_buf: [max_full_key_size]u8 = undefined;
         const key_len = encodeKey(&key_buf, self.name, doc_id);
         return self.btree().get(allocator, key_buf[0..key_len]);
+    }
+
+    /// Phase 4 / 5A batched lookup. For small batches (`< 128` ids)
+    /// each id gets its own tree descent — same shape as `Collection.get`
+    /// in a loop, but bundled into a single C call so Python doesn't
+    /// pay ctypes overhead per id. For larger batches we sort the ids
+    /// and walk a single iterator forward, picking up matches as we
+    /// pass them; that turns N × (log-tree-depth descents) into one
+    /// descent + a leaf-chain walk (sharding-aware via the
+    /// per-collection root).
+    ///
+    /// `out_lens[i]` is set to the value length for `ids[i]` (0 if
+    /// missing). Values are packed into `out_buf` in input order; on
+    /// overflow `*out_buf_used` is set to the total required size and
+    /// `error.BufferTooSmall` is returned so the caller can retry
+    /// with a larger buffer.
+    ///
+    /// The 128-id threshold is empirical — for randomly distributed
+    /// ids the sorted-scan path is ~2× the descent path at 256 and
+    /// up, but loses at 16 (the iterator walks through too many
+    /// non-matching entries between sorted matches). Re-tune if the
+    /// tree shape or your batch distribution differs.
+    pub fn getMany(
+        self: Collection,
+        allocator: Allocator,
+        ids: []const u64,
+        out_lens: []u32,
+        out_buf: []u8,
+        out_buf_used: *usize,
+    ) !bool {
+        std.debug.assert(ids.len == out_lens.len);
+        out_buf_used.* = 0;
+        if (ids.len == 0) return true;
+
+        try validateName(self.name);
+        const locked = !self.db.ownsTxn();
+        if (locked) self.db.mu.lockUncancelable(self.db.pager.io);
+        defer if (locked) self.db.mu.unlock(self.db.pager.io);
+
+        const sorted_scan_threshold: usize = 128;
+        return if (ids.len < sorted_scan_threshold)
+            self.getManyDescents(allocator, ids, out_lens, out_buf, out_buf_used)
+        else
+            self.getManySorted(allocator, ids, out_lens, out_buf, out_buf_used);
+    }
+
+    /// Per-id descent path (cheap when `ids.len` is small relative to
+    /// the tree). Same physical work as a `get`-loop but one C call.
+    fn getManyDescents(
+        self: Collection,
+        allocator: Allocator,
+        ids: []const u64,
+        out_lens: []u32,
+        out_buf: []u8,
+        out_buf_used: *usize,
+    ) !bool {
+        const bt = self.btree();
+        var key_buf: [max_full_key_size]u8 = undefined;
+        var temp_values = try allocator.alloc(?[]u8, ids.len);
+        defer {
+            for (temp_values) |maybe| if (maybe) |v| allocator.free(v);
+            allocator.free(temp_values);
+        }
+        @memset(temp_values, null);
+
+        var total: usize = 0;
+        for (ids, 0..) |id, i| {
+            const klen = encodeKey(&key_buf, self.name, id);
+            const value = try bt.get(allocator, key_buf[0..klen]);
+            if (value) |v| {
+                temp_values[i] = v;
+                total += v.len;
+            }
+        }
+        out_buf_used.* = total;
+        if (total > out_buf.len) return error.BufferTooSmall;
+
+        var offset: usize = 0;
+        for (temp_values, 0..) |maybe, i| {
+            if (maybe) |v| {
+                @memcpy(out_buf[offset..][0..v.len], v);
+                out_lens[i] = @intCast(v.len);
+                offset += v.len;
+            } else {
+                out_lens[i] = 0;
+            }
+        }
+        return true;
+    }
+
+    /// Sorted-scan path (cheap when `ids.len` is large enough that
+    /// the leaf walk amortizes the cost of intervening non-matching
+    /// entries). One descent + a forward iterator walk bounded by
+    /// the largest sought id (or the collection prefix).
+    fn getManySorted(
+        self: Collection,
+        allocator: Allocator,
+        ids: []const u64,
+        out_lens: []u32,
+        out_buf: []u8,
+        out_buf_used: *usize,
+    ) !bool {
+        const perm = try allocator.alloc(usize, ids.len);
+        defer allocator.free(perm);
+        for (perm, 0..) |*p, i| p.* = i;
+        const SortCtx = struct {
+            ids: []const u64,
+            fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+                return ctx.ids[a] < ctx.ids[b];
+            }
+        };
+        std.sort.pdq(usize, perm, SortCtx{ .ids = ids }, SortCtx.lessThan);
+
+        var temp_values = try allocator.alloc(?[]u8, ids.len);
+        defer {
+            for (temp_values) |maybe| if (maybe) |v| allocator.free(v);
+            allocator.free(temp_values);
+        }
+        @memset(temp_values, null);
+
+        const view = self.btree().view();
+        var prefix_buf: [max_full_key_size]u8 = undefined;
+        const prefix_len = encodeCollectionPrefix(&prefix_buf, self.name);
+        const prefix = prefix_buf[0..prefix_len];
+
+        const smallest_id = ids[perm[0]];
+        var seek_buf: [max_full_key_size]u8 = undefined;
+        const seek_len = encodeKey(&seek_buf, self.name, smallest_id);
+
+        var it = try view.iteratorFrom(allocator, seek_buf[0..seek_len]);
+        defer it.deinit();
+
+        var cur: ?btree_mod.LeafEntry = null;
+        var p: usize = 0;
+        while (p < ids.len) {
+            const orig = perm[p];
+            const sought_id = ids[orig];
+            var sk_buf: [max_full_key_size]u8 = undefined;
+            const sk_len = encodeKey(&sk_buf, self.name, sought_id);
+            const sought_key = sk_buf[0..sk_len];
+
+            if (cur == null) cur = try it.next();
+            const entry = cur orelse {
+                p += 1;
+                continue;
+            };
+            if (!std.mem.startsWith(u8, entry.key, prefix)) {
+                p += 1;
+                continue;
+            }
+            const cmp = std.mem.order(u8, entry.key, sought_key);
+            switch (cmp) {
+                .lt => cur = null,
+                .eq => {
+                    temp_values[orig] = try allocator.dupe(u8, entry.value);
+                    cur = null;
+                    p += 1;
+                },
+                .gt => p += 1,
+            }
+        }
+
+        var total: usize = 0;
+        for (temp_values) |maybe| if (maybe) |v| {
+            total += v.len;
+        };
+        out_buf_used.* = total;
+        if (total > out_buf.len) return error.BufferTooSmall;
+
+        var offset: usize = 0;
+        for (ids, 0..) |_, i| {
+            if (temp_values[i]) |v| {
+                @memcpy(out_buf[offset..][0..v.len], v);
+                out_lens[i] = @intCast(v.len);
+                offset += v.len;
+            } else {
+                out_lens[i] = 0;
+            }
+        }
+        return true;
     }
 
     pub fn delete(self: Collection, doc_id: u64) !bool {
