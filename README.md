@@ -299,12 +299,8 @@ const Bump = struct {
 try db.runOptimistic(8, Bump{ .target_id = 5 }, Bump.run);
 ```
 
-Caveats — design choices kept simple in this version:
+Caveats:
 
-- **Blind writes don't conflict-check.** If a txn does
-  `c.put(5, X)` without a preceding `c.get(5)`, no read-set entry is
-  recorded for key 5, so a concurrent committer that put `5 = Y` won't
-  cause a conflict. Last writer wins. Read before writing if you care.
 - **Range reads aren't tracked** (`findOne`, `findAll`, `findRange`,
   `iterator`). They go through the snapshot but don't add to the read
   set, so a concurrent insert into an observed range is a phantom.
@@ -313,6 +309,13 @@ Caveats — design choices kept simple in this version:
   contending on the same hot key can livelock the retry loop on each
   other; wrap with your own `std.Thread.sleep` if your workload has
   hot keys.
+
+Lost-update protection is automatic: every `put`/`delete` performs an
+implicit snapshot read of its target key before recording the write,
+so blind writes show up in the read set and a concurrent committer
+who modified the same key triggers `WriteConflict` at commit. Skip
+the read only when an earlier op in the same txn already covered the
+key (we've already seen its starting value).
 
 ### Pessimistic-write ceiling
 
@@ -528,8 +531,9 @@ Python tests live under `bindings/python/tests/` and are run with
 - [x] Group commit (leader/follower fsync coalescing in the WAL).
 - [x] OCC transactions (`Db.beginOptimistic` / `Db.runOptimistic`) —
       lock-free snapshot reads, buffered writes, conflict detection at
-      commit. Range-read tracking and write-set conflict detection
-      (lost-update protection for blind writes) are still TODO.
+      commit. Lost-update protection for blind writes via implicit
+      snapshot read on `put`/`delete`. Range-read tracking is still
+      TODO.
 - [ ] Concurrent B+Tree mutations (per-page locks, keyspace sharding,
       or LSM) — break past the `db.mu` ceiling for `.full`-mode
       auto-commit throughput.

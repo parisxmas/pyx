@@ -938,6 +938,17 @@ pub const OptimisticTxn = struct {
         return null;
     }
 
+    /// Whether `(coll, doc_id)` is already represented in the read set.
+    /// Used to avoid duplicating a recordRead when a key is touched
+    /// multiple times in the same txn (e.g. blind put followed by a
+    /// later get, or the implicit-read-on-write path).
+    fn hasReadSetEntry(self: *OptimisticTxn, coll: []const u8, doc_id: u64) bool {
+        for (self.read_set.items) |e| {
+            if (e.doc_id == doc_id and std.mem.eql(u8, e.coll, coll)) return true;
+        }
+        return false;
+    }
+
     fn recordRead(self: *OptimisticTxn, coll: []const u8, doc_id: u64, value: ?[]const u8) !void {
         const owned = try self.arena.allocator().dupe(u8, coll);
         const hash: u64 = if (value) |v| std.hash.Wyhash.hash(0, v) else 0;
@@ -978,6 +989,9 @@ pub const TxnCollection = struct {
 
     pub fn insert(self: TxnCollection, doc_bytes: []const u8) !u64 {
         try validateName(self.name);
+        // No implicit read: pager.reserveDocId hands back a fresh id
+        // from the atomic counter, so by construction no other writer
+        // can be touching it. There's nothing to compare-against.
         const id = self.txn.db.pager.reserveDocId();
         try self.txn.recordWrite(self.name, id, .insert, doc_bytes);
         return id;
@@ -985,16 +999,40 @@ pub const TxnCollection = struct {
 
     pub fn put(self: TxnCollection, doc_id: u64, doc_bytes: []const u8) !void {
         try validateName(self.name);
+        try self.recordImplicitReadIfNew(doc_id);
         try self.txn.recordWrite(self.name, doc_id, .put, doc_bytes);
     }
 
     pub fn delete(self: TxnCollection, doc_id: u64) !bool {
         try validateName(self.name);
+        try self.recordImplicitReadIfNew(doc_id);
         // We can't tell from the buffered state alone whether this
         // doc_id exists in the live tree. Buffer the delete; the
         // committed apply phase will short-circuit if it's missing.
         try self.txn.recordWrite(self.name, doc_id, .delete, "");
         return true;
+    }
+
+    /// Implicit snapshot read on the write path. Without this, blind
+    /// `put`/`delete` (no preceding `get` of the same key) would not
+    /// add an entry to the read_set, and a concurrent committer who
+    /// modified the same key between begin and commit would go
+    /// undetected — classic lost-update.
+    ///
+    /// Skipped when:
+    ///   - The key is already in our own write_set: an earlier op in
+    ///     this same txn established the precondition, no need to
+    ///     duplicate.
+    ///   - The key is already in our read_set: we recorded its
+    ///     start_root state via an earlier explicit get; a second
+    ///     entry would just be redundant work at validation time.
+    fn recordImplicitReadIfNew(self: TxnCollection, doc_id: u64) !void {
+        if (self.txn.lookupOwnWrite(self.name, doc_id)) |_| return;
+        if (self.txn.hasReadSetEntry(self.name, doc_id)) return;
+        const ally = self.txn.db.allocator;
+        const start_value = try self.txn.snapshot.collection(self.name).get(ally, doc_id);
+        defer if (start_value) |v| ally.free(v);
+        try self.txn.recordRead(self.name, doc_id, start_value);
     }
 
     pub fn get(self: TxnCollection, allocator: Allocator, doc_id: u64) !?[]u8 {
@@ -1964,4 +2002,135 @@ test "Db.runOptimistic: user-thrown error short-circuits, no retry" {
     var ctx = Ctx{ .attempts = &attempts };
     try testing.expectError(E.Boom, db.runOptimistic(8, &ctx, Ctx.run));
     try testing.expectEqual(@as(u32, 1), attempts);
+}
+
+test "OptimisticTxn: blind put detects lost-update via implicit read" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-blind-put.db");
+    defer db.close();
+
+    const v0 = try buildDoc("v0", 0);
+    defer ally.free(v0);
+    const v1 = try buildDoc("v1", 1);
+    defer ally.free(v1);
+    const v2 = try buildDoc("v2", 2);
+    defer ally.free(v2);
+
+    // Seed the doc.
+    const id = try db.collection("c").insert(v0);
+    try db.checkpoint();
+
+    // Txn A starts. It does NOT call get — just a blind put.
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    const c = txn.collection("c");
+    try c.put(id, v1);
+
+    // The implicit-read-on-write should have populated read_set with
+    // the doc's value at start_root (= v0).
+    try testing.expectEqual(@as(usize, 1), txn.read_set.items.len);
+    try testing.expectEqual(@as(usize, 1), txn.write_set.items.len);
+    const v0_hash = std.hash.Wyhash.hash(0, v0);
+    try testing.expectEqual(v0_hash, txn.read_set.items[0].value_hash);
+
+    // Concurrent committer changes the doc.
+    try db.collection("c").put(id, v2);
+
+    // A's commit should now see the read_set mismatch and conflict.
+    try testing.expectError(Error.WriteConflict, txn.commit());
+}
+
+test "OptimisticTxn: same-key put twice records read_set only once" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-dup-put.db");
+    defer db.close();
+
+    const seed = try buildDoc("seed", 0);
+    defer ally.free(seed);
+    const a = try buildDoc("a", 1);
+    defer ally.free(a);
+    const b = try buildDoc("b", 2);
+    defer ally.free(b);
+
+    const id = try db.collection("c").insert(seed);
+    try db.checkpoint();
+
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    const c = txn.collection("c");
+
+    try c.put(id, a);
+    try c.put(id, b);
+
+    // First put established the read_set entry; second put saw an
+    // existing own-write and skipped recordRead.
+    try testing.expectEqual(@as(usize, 1), txn.read_set.items.len);
+    try testing.expectEqual(@as(usize, 2), txn.write_set.items.len);
+
+    // Final live state after commit should be `b`.
+    try txn.commit();
+    const got = (try db.collection("c").get(ally, id)).?;
+    defer ally.free(got);
+    try testing.expectEqualSlices(u8, b, got);
+}
+
+test "OptimisticTxn: insert does not populate read_set" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-insert-noread.db");
+    defer db.close();
+
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    const c = txn.collection("c");
+    const d = try buildDoc("x", 1);
+    defer ally.free(d);
+    _ = try c.insert(d);
+
+    try testing.expectEqual(@as(usize, 0), txn.read_set.items.len);
+    try testing.expectEqual(@as(usize, 1), txn.write_set.items.len);
+
+    try txn.commit();
+}
+
+test "OptimisticTxn: concurrent disjoint blind puts both succeed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-disjoint-put.db");
+    defer db.close();
+
+    const seed = try buildDoc("seed", 0);
+    defer ally.free(seed);
+    const v_a = try buildDoc("a", 1);
+    defer ally.free(v_a);
+    const v_b = try buildDoc("b", 2);
+    defer ally.free(v_b);
+
+    const id_a = try db.collection("c").insert(seed);
+    const id_b = try db.collection("c").insert(seed);
+    try db.checkpoint();
+
+    var ta = try db.beginOptimistic();
+    errdefer ta.abort();
+    var tb = try db.beginOptimistic();
+    errdefer tb.abort();
+
+    try ta.collection("c").put(id_a, v_a);
+    try tb.collection("c").put(id_b, v_b);
+
+    try ta.commit();
+    try tb.commit();
+
+    const got_a = (try db.collection("c").get(ally, id_a)).?;
+    defer ally.free(got_a);
+    const got_b = (try db.collection("c").get(ally, id_b)).?;
+    defer ally.free(got_b);
+    try testing.expectEqualSlices(u8, v_a, got_a);
+    try testing.expectEqualSlices(u8, v_b, got_b);
 }
