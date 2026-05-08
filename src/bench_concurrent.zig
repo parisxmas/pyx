@@ -22,6 +22,13 @@
 //!   should scale rather than stay pinned to a single thread's fsync
 //!   latency.
 //!
+//! Phase D — concurrent OCC writers (read-modify-write).
+//!   For W in {1, 2, 4, 8}: spawn W threads each doing
+//!   read-modify-write txns through `Db.runOptimistic`. Each iteration
+//!   picks a random doc id from a pool of HOT_KEYS, reads it (lock-
+//!   free against the txn's snapshot), increments a counter inside,
+//!   and writes back. Smaller HOT_KEYS = higher conflict rate.
+//!
 //! All threads run for SECS_PHASE wall-clock seconds and report
 //! aggregate ops/sec. Run: `zig build bench-concurrent -Doptimize=ReleaseFast`.
 
@@ -312,6 +319,143 @@ fn runMultiWriterSweep(
     try out.print("\n", .{});
 }
 
+// Pool of doc_ids the OCC bench rotates through. Smaller pool ⇒ higher
+// conflict rate. 256 against 4-8 writers gives a moderate mix of
+// successful commits and WriteConflicts; tighten/loosen to taste.
+const OCC_HOT_KEYS: u64 = 256;
+const SECS_OCC: u64 = 1;
+
+const OccWriterCtx = struct {
+    db: *Db,
+    deadline_ns: u64,
+    rng_seed: u64,
+    io: Io,
+    out_commits: *u64,
+    out_conflicts: *u64,
+};
+
+const OccBumpCtx = struct {
+    target_id: u64,
+};
+
+fn occBumpRun(ctx: OccBumpCtx, txn: *pyx.db.OptimisticTxn) !void {
+    const ally = std.heap.c_allocator;
+    const c = txn.collection("occ");
+    const cur = try c.get(ally, ctx.target_id);
+    defer if (cur) |v| ally.free(v);
+    var prev: i64 = 0;
+    if (cur) |v| {
+        if (pyx.doc.parse(v)) |parsed| {
+            if (parsed.object.get("count") catch null) |cnt| {
+                prev = cnt.i64;
+            }
+        } else |_| {}
+    }
+    var b = Builder.init(ally);
+    defer b.deinit();
+    try b.beginDocument();
+    try b.putI64("count", prev + 1);
+    try b.endDocument();
+    const bytes = try b.finish();
+    defer ally.free(bytes);
+    try c.put(ctx.target_id, bytes);
+}
+
+fn occWriterLoop(ctx: *OccWriterCtx) void {
+    var prng = std.Random.DefaultPrng.init(ctx.rng_seed);
+    const r = prng.random();
+    var commits: u64 = 0;
+    var conflicts: u64 = 0;
+    while (nowNs(ctx.io) < ctx.deadline_ns) {
+        const target = 1 + r.uintLessThan(u64, OCC_HOT_KEYS);
+        const op_ctx = OccBumpCtx{ .target_id = target };
+        ctx.db.runOptimistic(64, op_ctx, occBumpRun) catch |e| switch (e) {
+            error.RetryBudgetExhausted => {
+                conflicts += 1;
+                continue;
+            },
+            else => return,
+        };
+        commits += 1;
+    }
+    ctx.out_commits.* = commits;
+    ctx.out_conflicts.* = conflicts;
+}
+
+fn runOccSweep(
+    out: *Io.Writer,
+    db: *Db,
+    io: Io,
+    ally: std.mem.Allocator,
+    writer_counts: []const u32,
+) !void {
+    try out.print("[N writers, OCC read-modify-write, {d} hot keys, {d}s/sub-phase] each thread reads, increments, writes via runOptimistic.\n", .{ OCC_HOT_KEYS, SECS_OCC });
+
+    // Pre-seed the hot-key pool so reads return non-null and parsing
+    // works.
+    {
+        try db.begin();
+        const c = db.collection("occ");
+        var i: u64 = 1;
+        while (i <= OCC_HOT_KEYS) : (i += 1) {
+            var b = Builder.init(ally);
+            defer b.deinit();
+            try b.beginDocument();
+            try b.putI64("count", 0);
+            try b.endDocument();
+            const bytes = try b.finish();
+            defer ally.free(bytes);
+            try c.put(i, bytes);
+        }
+        try db.commit();
+        try db.checkpoint();
+    }
+
+    for (writer_counts) |W| {
+        try db.checkpoint();
+        const deadline = nowNs(io) + SECS_OCC * std.time.ns_per_s;
+        const threads = try ally.alloc(std.Thread, W);
+        defer ally.free(threads);
+        const commits_per_thread = try ally.alloc(u64, W);
+        defer ally.free(commits_per_thread);
+        const conflicts_per_thread = try ally.alloc(u64, W);
+        defer ally.free(conflicts_per_thread);
+        const ctxs = try ally.alloc(OccWriterCtx, W);
+        defer ally.free(ctxs);
+
+        for (0..W) |i| {
+            commits_per_thread[i] = 0;
+            conflicts_per_thread[i] = 0;
+            ctxs[i] = .{
+                .db = db,
+                .deadline_ns = deadline,
+                .rng_seed = 0x4000 + i,
+                .io = io,
+                .out_commits = &commits_per_thread[i],
+                .out_conflicts = &conflicts_per_thread[i],
+            };
+            threads[i] = try std.Thread.spawn(.{}, occWriterLoop, .{&ctxs[i]});
+        }
+        for (threads) |t| t.join();
+
+        var commits: u64 = 0;
+        var conflicts: u64 = 0;
+        for (commits_per_thread) |o| commits += o;
+        for (conflicts_per_thread) |o| conflicts += o;
+        const elapsed_ns = SECS_OCC * std.time.ns_per_s;
+        try out.print(
+            "  W={d}: {d:>7} commits/s ({d:.0}/thr) | {d} budget-exhausted retries\n",
+            .{
+                W,
+                @as(u64, @intFromFloat(opsPerSec(commits, elapsed_ns))),
+                opsPerSec(commits, elapsed_ns) / @as(f64, @floatFromInt(W)),
+                conflicts,
+            },
+        );
+    }
+    try out.print("\n", .{});
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var stdout_buffer: [4096]u8 = undefined;
@@ -360,6 +504,8 @@ pub fn main(init: std.process.Init) !void {
 
     const writer_counts = [_]u32{ 1, 2, 4, 8 };
     try runMultiWriterSweep(out, &db, io, ally, &writer_counts);
+
+    try runOccSweep(out, &db, io, ally, &writer_counts);
 
     try out.flush();
 }

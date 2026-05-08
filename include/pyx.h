@@ -1,5 +1,5 @@
 /*
- * pyx — embeddable document database. C ABI v0.1.0.
+ * pyx — embeddable document database. C ABI v0.2.0.
  *
  * Design notes
  * ============
@@ -41,7 +41,7 @@ extern "C" {
 /* ===================================================================== */
 
 #define PYX_VERSION_MAJOR 0
-#define PYX_VERSION_MINOR 1
+#define PYX_VERSION_MINOR 2
 #define PYX_VERSION_PATCH 0
 
 /* Packed version: (major << 16) | (minor << 8) | patch. */

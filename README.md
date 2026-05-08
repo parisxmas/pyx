@@ -245,15 +245,21 @@ elsewhere.
 
 ## Concurrency model
 
-The model is intentionally simple:
+Three styles of transaction:
+
+| Style                          | Begin           | Reads                    | Writes                | Commit                 |
+|--------------------------------|-----------------|--------------------------|-----------------------|------------------------|
+| Pessimistic (`Db.begin`)       | takes `db.mu`   | through page cache       | applied immediately   | release `db.mu`        |
+| Auto-commit                    | takes `db.mu`   | through page cache       | applied immediately   | release `db.mu`        |
+| Optimistic (`Db.beginOptimistic`) | snapshot-only  | **lock-free** via mmap   | buffered until commit | brief `db.mu` for validate + apply |
+
+And readers:
 
 | Operation                         | Lock?               | Multi-thread?              |
 |-----------------------------------|---------------------|----------------------------|
-| Auto-commit `insert`/`put`/`delete` | internal mutex       | yes (serialised)           |
-| Explicit `begin`/`commit`         | held until commit   | single thread per txn      |
-| `Collection.iterator`             | mutex during open   | one thread per iterator    |
 | `Snapshot` (taken outside a txn)  | **none on reads**   | **N readers, lock-free**   |
 | `Snapshot.findOne` / `findRange`  | **none**            | **N readers, lock-free**   |
+| `Collection.iterator`             | mutex during open   | one thread per iterator    |
 
 Snapshot reads bypass the page cache and pager state entirely — they
 `memcpy` from an `mmap`'d region (or fall back to `pread`, which POSIX
@@ -261,22 +267,66 @@ guarantees is thread-safe per fd). Because the B+Tree is copy-on-write,
 pages reachable from the captured root are never mutated; writers append
 new pages past the snapshot's mapped length.
 
-The current engine is **single-writer at the B+Tree** — concurrent
-auto-commit writes from many threads are correct (they serialise on
-`db.mu`) but B+Tree mutations don't parallelise. Group commit *does*
-collapse fsync syscalls across concurrent `.full`-mode writers via a
-leader/follower queue in the WAL: the first arrival snapshots the
-in-kernel write watermark, fsyncs once, and broadcasts to followers
-whose commits fall under that watermark. This gives a small win in
-practice (1.4× at 2 writers on macOS APFS, plateauing past that),
-because once fsync is fast enough that one writer's iteration matches
-the next's traversal of `db.mu`, the followers don't pile up at the
-fsync queue and `db.mu` becomes the ceiling rather than fsync.
+### OCC: optimistic concurrency
 
-Concurrent B+Tree mutations (per-page locks) are the v2 path to
-breaking past the `db.mu` ceiling. Until then, batching multiple ops
-into one explicit transaction (`begin` / `op` × N / `commit`) is
-already the right answer for write-heavy workloads.
+`Db.beginOptimistic()` returns a transaction that captures a snapshot
+of the current B+Tree. Reads against the txn go through the snapshot
+(lock-free `mmap`); writes are buffered in a private write set. At
+`commit()`, the engine briefly takes `db.mu` to:
+
+1. **Validate** — re-read every observed `(coll, doc_id)` against the
+   live tree; if any value's hash has changed, return
+   `error.WriteConflict`.
+2. **Apply** — replay the buffered writes against the live tree, append
+   the WAL record, advance the root.
+
+The `Db.runOptimistic(max_attempts, ctx, fn)` helper wraps this in an
+automatic retry on `WriteConflict`. Many OCC txns can run their
+read+work phases concurrently from different threads; only the
+validate-and-apply step at commit serialises.
+
+```zig
+const Bump = struct {
+    target_id: u64,
+    fn run(self: @This(), txn: *pyx.db.OptimisticTxn) !void {
+        const c = txn.collection("counters");
+        const cur = (try c.get(allocator, self.target_id)).?;
+        defer allocator.free(cur);
+        // …compute new value from cur…
+        try c.put(self.target_id, new_bytes);
+    }
+};
+try db.runOptimistic(8, Bump{ .target_id = 5 }, Bump.run);
+```
+
+Caveats — design choices kept simple in this version:
+
+- **Blind writes don't conflict-check.** If a txn does
+  `c.put(5, X)` without a preceding `c.get(5)`, no read-set entry is
+  recorded for key 5, so a concurrent committer that put `5 = Y` won't
+  cause a conflict. Last writer wins. Read before writing if you care.
+- **Range reads aren't tracked** (`findOne`, `findAll`, `findRange`,
+  `iterator`). They go through the snapshot but don't add to the read
+  set, so a concurrent insert into an observed range is a phantom.
+  Range tracking is on the roadmap.
+- **`runOptimistic` does not back off** between attempts. Two threads
+  contending on the same hot key can livelock the retry loop on each
+  other; wrap with your own `std.Thread.sleep` if your workload has
+  hot keys.
+
+### Pessimistic-write ceiling
+
+Pessimistic and auto-commit writes serialise on `db.mu` for the whole
+B+Tree mutation. Group commit collapses *fsync syscalls* across
+concurrent `.full`-mode writers via a leader/follower queue in the WAL,
+giving 1.4× at 2 writers on macOS APFS and plateauing past that.
+Concurrent B+Tree mutations (per-page locks on a non-CoW writer path,
+sharding, or LSM) would be the next move past the `db.mu` ceiling, but
+in practice batching ops into a single explicit txn (4 M ops/s
+single-thread) is the right answer for write-heavy workloads. OCC is
+the right answer for transactions that need to read-and-then-write
+across multiple keys — the lock-free read phase is where the
+concurrency win lives.
 
 ---
 
@@ -437,8 +487,13 @@ Python tests live under `bindings/python/tests/` and are run with
 ## Roadmap
 
 - [x] Group commit (leader/follower fsync coalescing in the WAL).
-- [ ] Concurrent B+Tree mutations (per-page locks) — the next move past
-      the `db.mu` ceiling for `.full`-mode auto-commit throughput.
+- [x] OCC transactions (`Db.beginOptimistic` / `Db.runOptimistic`) —
+      lock-free snapshot reads, buffered writes, conflict detection at
+      commit. Range-read tracking and write-set conflict detection
+      (lost-update protection for blind writes) are still TODO.
+- [ ] Concurrent B+Tree mutations (per-page locks, keyspace sharding,
+      or LSM) — break past the `db.mu` ceiling for `.full`-mode
+      auto-commit throughput.
 - [ ] Compound indexes.
 - [ ] Streaming `findRange` paging cursor in the C ABI.
 - [ ] Background checkpointer.

@@ -39,10 +39,12 @@ pub const Error = error{
     NoSuchIndex,
     /// Returned by `OptimisticTxn.commit()` when validation detects that
     /// another committed transaction modified a key in this txn's read
-    /// set. Caller is expected to retry. Phase 1 reserves the error in
-    /// the API surface but cannot yet produce it (txns still serialise
-    /// on the data lock).
+    /// set since it began. Caller should retry — typically via
+    /// `Db.runOptimistic`.
     WriteConflict,
+    /// Returned by `Db.runOptimistic` when the retry budget is
+    /// exhausted without a successful commit.
+    RetryBudgetExhausted,
 };
 
 const max_prefix_size: usize = 1 + 10 + max_collection_name; // namespace + varint + name
@@ -249,6 +251,45 @@ pub const Db = struct {
             .read_set = .empty,
             .write_set = .empty,
         };
+    }
+
+    /// Run an OCC transaction with automatic retry on
+    /// `error.WriteConflict`. The caller's `func` receives the active
+    /// txn handle and returns either a value (any user error type) or
+    /// void; on success the helper commits, on `WriteConflict` it
+    /// abandons the txn and starts a fresh one. Other user errors
+    /// short-circuit and are returned to the caller.
+    ///
+    /// Note: this version does NOT sleep between attempts. Two threads
+    /// contending on the same hot key can livelock the retry loop on
+    /// each other. If you have a contention-prone workload, wrap this
+    /// with your own backoff (`std.Thread.sleep` etc).
+    ///
+    /// Returns `error.RetryBudgetExhausted` if `max_attempts` is
+    /// reached without a successful commit.
+    pub fn runOptimistic(
+        self: *Db,
+        max_attempts: u32,
+        context: anytype,
+        comptime func: fn (@TypeOf(context), *OptimisticTxn) anyerror!void,
+    ) !void {
+        var attempts: u32 = 0;
+        while (attempts < max_attempts) : (attempts += 1) {
+            var txn = try self.beginOptimistic();
+            // No errdefer needed — every exit path either calls
+            // commit (which deinits) or abort (also deinits), and
+            // OptimisticTxn.deinitAll is idempotent.
+            func(context, &txn) catch |e| {
+                txn.abort();
+                return e;
+            };
+            txn.commit() catch |e| switch (e) {
+                error.WriteConflict => continue,
+                else => return e,
+            };
+            return;
+        }
+        return Error.RetryBudgetExhausted;
     }
 
     pub fn collection(self: *Db, name: []const u8) Collection {
@@ -1870,4 +1911,54 @@ test "OptimisticTxn: 4 threads, disjoint inserts, all commit" {
         @as(u64, num_threads * per_thread),
         try db.collection("c").count(ally),
     );
+}
+
+test "Db.runOptimistic: success path commits without retry" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-runopt.db");
+    defer db.close();
+
+    const Ctx = struct {
+        doc: []const u8,
+        out_id: *u64,
+        fn run(self: *@This(), txn: *OptimisticTxn) !void {
+            const c = txn.collection("c");
+            self.out_id.* = try c.insert(self.doc);
+        }
+    };
+
+    const d = try buildDoc("hello", 1);
+    defer ally.free(d);
+    var id: u64 = 0;
+    var ctx = Ctx{ .doc = d, .out_id = &id };
+    try db.runOptimistic(8, &ctx, Ctx.run);
+
+    const got = (try db.collection("c").get(ally, id)).?;
+    defer ally.free(got);
+    try testing.expectEqualSlices(u8, d, got);
+}
+
+test "Db.runOptimistic: user-thrown error short-circuits, no retry" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-runopt-err.db");
+    defer db.close();
+
+    const E = error{Boom};
+    const Ctx = struct {
+        attempts: *u32,
+        fn run(self: *@This(), txn: *OptimisticTxn) !void {
+            _ = txn;
+            self.attempts.* += 1;
+            return E.Boom;
+        }
+    };
+
+    var attempts: u32 = 0;
+    var ctx = Ctx{ .attempts = &attempts };
+    try testing.expectError(E.Boom, db.runOptimistic(8, &ctx, Ctx.run));
+    try testing.expectEqual(@as(u32, 1), attempts);
 }

@@ -100,11 +100,11 @@ export fn pyx_last_error() [*:0]const u8 {
 // ====================================================================
 
 export fn pyx_version() u32 {
-    return (0 << 16) | (1 << 8) | 0;
+    return (0 << 16) | (2 << 8) | 0;
 }
 
 export fn pyx_version_string() [*:0]const u8 {
-    return "0.1.0";
+    return "0.2.0";
 }
 
 export fn pyx_format_version() u32 {
