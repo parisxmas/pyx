@@ -197,6 +197,13 @@ pyx_iter_next = _bind(
 )
 pyx_iter_close = _bind("pyx_iter_close", None, C.c_void_p)
 
+# Collections (sharding phase 2C)
+pyx_create_collection = _bind(
+    "pyx_create_collection",
+    C.c_int,
+    C.c_void_p, C.c_char_p, C.c_size_t, C.POINTER(C.c_uint32),
+)
+
 # Indexes
 pyx_create_index = _bind(
     "pyx_create_index",

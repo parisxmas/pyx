@@ -220,6 +220,26 @@ class Db:
     def collection(self, name: str) -> "Collection":
         return Collection(self, name)
 
+    def create_collection(self, name: str) -> int:
+        """Create a new collection backed by its own B+Tree. Idempotent —
+        re-calling with an existing name returns the same id without
+        allocating a new one. Returns the integer CollectionId.
+
+        Default usage (without create_collection) keeps every collection
+        in the shared default tree, which is backward-compatible with
+        pre-sharding pyx. Calling create_collection opts a specific
+        name into a separate tree, isolating its writes from the rest.
+
+        Phase 2C limitation: indexes and run_optimistic don't yet
+        understand non-default collections. CRUD via insert/get/delete
+        works; create_index and run_optimistic on a created collection
+        are phase 3 work.
+        """
+        nb = _utf8(name)
+        out = C.c_uint32(0)
+        _check(_ffi.pyx_create_collection(self._handle, nb, len(nb), C.byref(out)))
+        return int(out.value)
+
     def snapshot(self) -> "Snapshot":
         out = C.c_void_p()
         _check(_ffi.pyx_snapshot_open(self._handle, C.byref(out)))

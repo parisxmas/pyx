@@ -430,6 +430,30 @@ export fn pyx_iter_close(iter: ?*IteratorState) void {
 }
 
 // ====================================================================
+// Collections (sharding phase 2C)
+// ====================================================================
+
+/// Create a new collection backed by its own B+Tree. Idempotent —
+/// re-calling with an existing name returns the same id without
+/// allocating a new one. The id is written to `*out_id` (which may
+/// be NULL if the caller doesn't need it; the registration still
+/// happens). Returns a status code.
+export fn pyx_create_collection(
+    db: ?*State,
+    name: ?[*]const u8, name_len: usize,
+    out_id: ?*u32,
+) c_int {
+    const s = db orelse return status_invalid_arg;
+    const n = nameSliceFromCArg(name, name_len) orelse return status_invalid_arg;
+    const id = s.db.createCollection(n) catch |err| {
+        setLastError("pyx_create_collection: {t}", .{err});
+        return statusFromError(err);
+    };
+    if (out_id) |p| p.* = id;
+    return status_ok;
+}
+
+// ====================================================================
 // Indexes
 // ====================================================================
 

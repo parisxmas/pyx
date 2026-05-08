@@ -47,6 +47,11 @@ pub const ns_registry_compound: u8 = 0x03;
 /// namespace from single-field entries keeps the two formats isolated
 /// — old DBs with single-field indexes are unaffected by this addition.
 pub const ns_index_compound: u8 = 0x04;
+/// Collection-catalog entry (sharding phase 2C): `\x05 + name`.
+/// Value is `u32 LE` — the CollectionId allocated for this name.
+/// Lives in the default tree (id 0), which acts as the metadata
+/// home for the entire DB.
+pub const ns_collection_catalog: u8 = 0x05;
 
 const max_collection_name: usize = 200;
 const max_field_path: usize = 200;

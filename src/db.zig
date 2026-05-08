@@ -151,6 +151,51 @@ fn replayWal(allocator: Allocator, pager: *pager_mod.Pager) !void {
     try pager.checkpoint();
 }
 
+// === Collection-catalog helpers (sharding phase 2C) ====================
+
+/// Catalog keys: `ns_collection_catalog (1 byte) + name`. Names are
+/// already validated (1..max_collection_name) so the encoded key fits
+/// within `max_full_key_size`.
+fn encodeCatalogKey(buf: []u8, name: []const u8) usize {
+    buf[0] = index_mod.ns_collection_catalog;
+    @memcpy(buf[1 .. 1 + name.len], name);
+    return 1 + name.len;
+}
+
+/// Walk the default tree's `\x05`-prefixed entries and load every
+/// (name → CollectionId) mapping into the cache. Also marks the
+/// matching shm slot in_use, so the cross-process state agrees with
+/// the catalog after a fresh open / shm rebuild.
+fn loadCollectionsCache(
+    allocator: Allocator,
+    pager: *pager_mod.Pager,
+    cache: *std.StringHashMapUnmanaged(pager_mod.CollectionId),
+) !void {
+    const bt = btree_mod.BTree.init(allocator, pager, pager_mod.default_collection_id);
+    var seek: [1]u8 = .{index_mod.ns_collection_catalog};
+    var it = try bt.iteratorFrom(allocator, &seek);
+    defer it.deinit();
+    while (try it.next()) |entry| {
+        if (entry.key.len < 1 or entry.key[0] != index_mod.ns_collection_catalog) break;
+        const name = entry.key[1..];
+        if (entry.value.len < 4) continue;
+        const id: pager_mod.CollectionId = @intCast(mem.readInt(u32, entry.value[0..4], .little));
+        if (id >= pager_mod.max_collections) continue;
+        const owned = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned);
+        try cache.put(allocator, owned, id);
+        pager.shm.setCollectionInUse(id, true);
+    }
+}
+
+fn freeCollectionsCache(
+    allocator: Allocator,
+    cache: *std.StringHashMapUnmanaged(pager_mod.CollectionId),
+) void {
+    var it = cache.iterator();
+    while (it.next()) |e| allocator.free(e.key_ptr.*);
+    cache.deinit(allocator);
+}
 
 pub const Db = struct {
     allocator: Allocator,
@@ -161,11 +206,21 @@ pub const Db = struct {
     /// 0 = no holder. Lets the same thread re-enter via auto-commit ops
     /// without trying to relock the (non-reentrant) Mutex.
     txn_owner: std.atomic.Value(std.Thread.Id),
+    /// In-memory cache of collection name → CollectionId. Populated at
+    /// open time by scanning the default tree for `ns_collection_catalog`
+    /// keys (sharding phase 2C). The cache OWNS its key bytes —
+    /// `Db.close` frees them.
+    collections: std.StringHashMapUnmanaged(pager_mod.CollectionId),
 
     pub fn open(allocator: Allocator, io: Io, dir: Dir, sub_path: []const u8) !Db {
         var pager = try pager_mod.Pager.open(allocator, io, dir, sub_path);
         errdefer pager.close();
         try replayWal(allocator, &pager);
+
+        var collections: std.StringHashMapUnmanaged(pager_mod.CollectionId) = .empty;
+        errdefer freeCollectionsCache(allocator, &collections);
+        try loadCollectionsCache(allocator, &pager, &collections);
+
         var indexes = index_mod.Manager.init(allocator);
         errdefer indexes.deinit();
         try indexes.loadFromPager(&pager);
@@ -175,6 +230,7 @@ pub const Db = struct {
             .indexes = indexes,
             .mu = Mutex.init,
             .txn_owner = .init(0),
+            .collections = collections,
         };
     }
 
@@ -184,6 +240,7 @@ pub const Db = struct {
 
     pub fn close(self: *Db) void {
         self.indexes.deinit();
+        freeCollectionsCache(self.allocator, &self.collections);
         self.pager.close();
     }
 
@@ -328,10 +385,75 @@ pub const Db = struct {
     }
 
     pub fn collection(self: *Db, name: []const u8) Collection {
-        // Phase 1 of keyspace sharding: every collection name resolves
-        // to the single shared default tree. Phase 2 will look the id
-        // up in a persistent registry.
-        return .{ .db = self, .name = name, .id = pager_mod.default_collection_id };
+        // Sharding phase 2C: name → id resolves through the in-memory
+        // catalog cache (populated at open from `\x05`-prefixed entries
+        // in the default tree). Names that aren't in the catalog
+        // resolve to the default collection — backward compatible with
+        // pre-2C usage where every `db.collection("X")` shared the
+        // default tree.
+        const id = self.collections.get(name) orelse pager_mod.default_collection_id;
+        return .{ .db = self, .name = name, .id = id };
+    }
+
+    /// Create a new collection backed by its own B+Tree. Idempotent —
+    /// re-calling with an existing name returns that collection's id
+    /// without writing anything. Allocates the next free shm slot
+    /// (1..max_collections) and persists the name → id mapping in
+    /// the default tree's catalog (`\x05`-prefixed key).
+    ///
+    /// Sharding phase 2C limitation: indexes and OCC don't yet
+    /// understand non-default collections. CRUD via
+    /// `db.collection(name).insert/get/delete` works; `createIndex`
+    /// and `runOptimistic` for non-default collections are phase 3.
+    pub fn createCollection(self: *Db, name: []const u8) !pager_mod.CollectionId {
+        try validateName(name);
+        if (self.collections.get(name)) |existing| return existing;
+
+        if (self.ownsTxn()) {
+            return Error.CollectionNameInvalid; // not yet supported inside an explicit txn
+        }
+
+        var commit_lsn: u64 = 0;
+        const id = blk: {
+            self.mu.lockUncancelable(self.pager.io);
+            defer self.mu.unlock(self.pager.io);
+            try self.pager.begin();
+            errdefer self.pager.abort();
+
+            // Find the lowest unused slot starting at 1 (slot 0 reserved for default).
+            var alloc_id: pager_mod.CollectionId = 0;
+            var slot: usize = 1;
+            while (slot < pager_mod.max_collections) : (slot += 1) {
+                if (!self.pager.shm.collectionInUse(slot)) {
+                    alloc_id = @intCast(slot);
+                    break;
+                }
+            }
+            if (alloc_id == 0) return Error.CollectionNameInvalid; // catalog full
+
+            // Persist the catalog entry. The put goes through the
+            // WAL as a V2 record at collection_id=0 (catalog lives in
+            // the default tree).
+            var key_buf: [max_full_key_size]u8 = undefined;
+            const key_len = encodeCatalogKey(&key_buf, name);
+            var val_buf: [4]u8 = undefined;
+            mem.writeInt(u32, &val_buf, alloc_id, .little);
+            const default_bt = btree_mod.BTree.init(self.allocator, &self.pager, pager_mod.default_collection_id);
+            try default_bt.put(key_buf[0..key_len], &val_buf);
+
+            self.pager.shm.setCollectionInUse(alloc_id, true);
+
+            commit_lsn = try self.pager.commitAppend();
+            try self.pager.applyAndFinalize();
+            break :blk alloc_id;
+        };
+        try self.pager.syncTo(commit_lsn);
+
+        // Update in-memory cache (key copy is owned by the cache).
+        const owned = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned);
+        try self.collections.put(self.allocator, owned, id);
+        return id;
     }
 
     /// Capture a consistent point-in-time view of the database. The
@@ -354,9 +476,15 @@ pub const Db = struct {
     /// is preserved only for snapshots taken outside any txn.
     pub fn snapshot(self: *Db) !Snapshot {
         if (self.ownsTxn()) {
+            var roots: [pager_mod.max_collections]PageId = [_]PageId{0} ** pager_mod.max_collections;
+            var i: usize = 0;
+            while (i < pager_mod.max_collections) : (i += 1) {
+                roots[i] = self.pager.bTreeRoot(@intCast(i));
+            }
             return .{
                 .db = self,
-                .btree_root = self.pager.bTreeRoot(pager_mod.default_collection_id),
+                .btree_root = roots[pager_mod.default_collection_id],
+                .btree_roots = roots,
                 .file = self.pager.file,
                 .io = self.pager.io,
                 .lock_free = false,
@@ -383,9 +511,19 @@ pub const Db = struct {
                 .populate = false,
             },
         ) catch null;
+        // Capture every collection's root atomically while we hold
+        // db.mu (and the pager has just flushed dirty pages, so shm
+        // matches the on-disk state). Slots that were 0 stay 0 — an
+        // empty tree.
+        var roots: [pager_mod.max_collections]PageId = [_]PageId{0} ** pager_mod.max_collections;
+        var i: usize = 0;
+        while (i < pager_mod.max_collections) : (i += 1) {
+            roots[i] = self.pager.bTreeRoot(@intCast(i));
+        }
         return .{
             .db = self,
-            .btree_root = self.pager.bTreeRoot(pager_mod.default_collection_id),
+            .btree_root = roots[pager_mod.default_collection_id],
+            .btree_roots = roots,
             .file = self.pager.file,
             .io = self.pager.io,
             .lock_free = true,
@@ -677,7 +815,15 @@ pub const Collection = struct {
 
 pub const Snapshot = struct {
     db: *Db,
+    /// Mirrors `btree_roots[default_collection_id]`. Kept as a flat
+    /// field for OCC's `start_root` and other call sites that want
+    /// the default tree's root without having to thread an id.
     btree_root: PageId,
+    /// All in-use collection roots captured atomically at snapshot
+    /// time (sharding phase 2C). `SnapshotCollection.view()` uses
+    /// `btree_roots[id]` to walk the right tree. Slots whose
+    /// `in_use` was false at capture time are 0.
+    btree_roots: [pager_mod.max_collections]PageId,
     file: std.Io.File,
     io: std.Io,
     /// True for snapshots captured outside any txn — reads go straight to
@@ -692,7 +838,8 @@ pub const Snapshot = struct {
     mmap: ?std.Io.File.MemoryMap,
 
     pub fn collection(self: Snapshot, name: []const u8) SnapshotCollection {
-        return .{ .snapshot = self, .name = name, .id = pager_mod.default_collection_id };
+        const id = self.db.collections.get(name) orelse pager_mod.default_collection_id;
+        return .{ .snapshot = self, .name = name, .id = id };
     }
 
     pub fn deinit(self: *Snapshot) void {
@@ -713,7 +860,7 @@ pub const SnapshotCollection = struct {
             .pager = if (self.snapshot.lock_free) null else &self.snapshot.db.pager,
             .file = self.snapshot.file,
             .io = self.snapshot.io,
-            .root = self.snapshot.btree_root,
+            .root = self.snapshot.btree_roots[self.id],
             .mmap = if (self.snapshot.mmap) |m| m.memory else null,
         };
     }
@@ -743,7 +890,7 @@ pub const SnapshotCollection = struct {
         const locked = !self.snapshot.db.ownsTxn();
         if (locked) self.snapshot.db.mu.lockUncancelable(self.snapshot.db.pager.io);
         defer if (locked) self.snapshot.db.mu.unlock(self.snapshot.db.pager.io);
-        return Iterator.openWithRoot(allocator, &self.snapshot.db.pager, self.snapshot.btree_root, self.name);
+        return Iterator.openWithRoot(allocator, &self.snapshot.db.pager, self.snapshot.btree_roots[self.id], self.name);
     }
 
     pub fn count(self: SnapshotCollection, allocator: Allocator) !u64 {
@@ -3104,4 +3251,112 @@ test "compound index: build-while-scan picks up pre-existing docs" {
         &.{ "last", "first" },
         &.{ .{ .string = "jones" }, .{ .string = "c" } },
     ));
+}
+
+test "sharding 2C: createCollection allocates a fresh id, idempotent on re-call" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+
+    var db = try Db.open(ally, testing.io, tmp.dir, "phase2c.pyx");
+    defer db.close();
+
+    // Default-collection routing unchanged.
+    try testing.expectEqual(@as(pager_mod.CollectionId, 0), db.collection("notes").id);
+
+    const id_users = try db.createCollection("users");
+    try testing.expect(id_users != 0);
+    try testing.expectEqual(id_users, db.collection("users").id);
+
+    // Re-call returns the same id; doesn't bump anything.
+    try testing.expectEqual(id_users, try db.createCollection("users"));
+
+    const id_orders = try db.createCollection("orders");
+    try testing.expect(id_orders != 0);
+    try testing.expect(id_orders != id_users);
+}
+
+test "sharding 2C: catalog survives close/reopen + lost shm" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+
+    var saved_id: pager_mod.CollectionId = 0;
+    {
+        var db = try Db.open(ally, testing.io, tmp.dir, "phase2c-persist.pyx");
+        defer db.close();
+        saved_id = try db.createCollection("widgets");
+
+        // Insert into the new collection — this writes a V2 record at
+        // collection_id=saved_id and updates that slot's root.
+        const c = db.collection("widgets");
+        const widget = "{\"name\":\"frob\"}";
+        _ = try c.insert(widget);
+        try db.checkpoint();
+    }
+
+    // Wipe the shm so reopen has to reconstruct everything from the
+    // on-disk header + catalog.
+    tmp.dir.deleteFile(testing.io, "phase2c-persist.pyx-shm") catch {};
+
+    var db = try Db.open(ally, testing.io, tmp.dir, "phase2c-persist.pyx");
+    defer db.close();
+
+    // Catalog cache rebuilt from the default tree.
+    try testing.expectEqual(saved_id, db.collection("widgets").id);
+
+    // Slot is back in_use.
+    try testing.expect(db.pager.shm.collectionInUse(saved_id));
+
+    // Inserted doc round-trips. (Doc id 1 is the first id allocated.)
+    const got = (try db.collection("widgets").get(ally, 1)).?;
+    defer ally.free(got);
+    try testing.expect(std.mem.indexOf(u8, got, "frob") != null);
+}
+
+test "sharding 2C: created-collection data is isolated from default" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+
+    var db = try Db.open(ally, testing.io, tmp.dir, "phase2c-iso.pyx");
+    defer db.close();
+
+    _ = try db.createCollection("orders");
+
+    const default_c = db.collection("notes"); // unregistered → id 0
+    const orders_c = db.collection("orders"); // registered → non-zero id
+
+    const default_id = try default_c.insert("{\"in\":\"default-tree\"}");
+    const orders_id = try orders_c.insert("{\"in\":\"orders-tree\"}");
+
+    // Each collection sees only its own data via doc id.
+    {
+        const v = (try default_c.get(ally, default_id)).?;
+        defer ally.free(v);
+        try testing.expect(std.mem.indexOf(u8, v, "default-tree") != null);
+    }
+    try testing.expect((try default_c.get(ally, orders_id)) == null);
+    {
+        const v = (try orders_c.get(ally, orders_id)).?;
+        defer ally.free(v);
+        try testing.expect(std.mem.indexOf(u8, v, "orders-tree") != null);
+    }
+    try testing.expect((try orders_c.get(ally, default_id)) == null);
+
+    // Snapshot also routes per-id correctly.
+    var snap = try db.snapshot();
+    defer snap.deinit();
+    {
+        const v = (try snap.collection("notes").get(ally, default_id)).?;
+        defer ally.free(v);
+        try testing.expect(std.mem.indexOf(u8, v, "default-tree") != null);
+    }
+    {
+        const v = (try snap.collection("orders").get(ally, orders_id)).?;
+        defer ally.free(v);
+        try testing.expect(std.mem.indexOf(u8, v, "orders-tree") != null);
+    }
+    try testing.expect((try snap.collection("notes").get(ally, orders_id)) == null);
+    try testing.expect((try snap.collection("orders").get(ally, default_id)) == null);
 }

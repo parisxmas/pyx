@@ -8,6 +8,48 @@ tag goes under `## Unreleased`.
 ## Unreleased
 
 ### Added
+- Keyspace sharding, phase 2C: the user-facing API. Calling
+  `db.create_collection("foo")` (Python) / `db.createCollection("foo")`
+  (Zig) / `pyx_create_collection(...)` (C) allocates the next free
+  shm slot, persists a `name → CollectionId` mapping in the default
+  tree's catalog (`\x05`-prefixed key), and from then on
+  `db.collection("foo")` resolves to that id and operations route
+  through that collection's own B+Tree. Idempotent — re-calling
+  with an existing name returns the same id without writing.
+  - **In-memory cache**: `Db.collections: StringHashMap(CollectionId)`,
+    populated at open by scanning `\x05`-prefixed entries in the
+    default tree and freed at close. Cache lookup keeps
+    `db.collection(name)` O(1).
+  - **Catalog scan also reseeds shm**: every id found in the catalog
+    has its slot marked in_use, so a process whose shm got wiped
+    (machine reboot) recovers the live state purely from the on-disk
+    catalog + header. `Db.createCollection` allocates the lowest
+    free slot starting at 1 (slot 0 reserved for the default tree).
+  - **Snapshot multi-root**: `Snapshot` now captures every in-use
+    collection's root atomically, in `btree_roots[max_collections]`.
+    `Snapshot.collection(name)` consults the catalog cache to pick
+    the right slot; `SnapshotCollection.view()` uses `btree_roots[id]`.
+    `btree_root` (singular) stays as a mirror of slot 0 so OCC's
+    `start_root` and pre-2C call sites still work.
+  - **C ABI**: `pyx_create_collection(db, name, len, *out_id)` —
+    new export, status code returned.
+  - **Python**: `Db.create_collection(name) -> int`, alongside the
+    existing `Db.collection(name)` which now consults the catalog.
+  - Three new tests: id allocation + idempotency, catalog survives
+    close/reopen + lost shm (rebuilt purely from on-disk default
+    tree), and isolation between default and created collections
+    (including snapshot routing).
+  - **Phase 2C limitations** (deferred to phase 3):
+    - `createIndex` on a created collection writes the index
+      machinery to the default tree, so index-backed lookups on
+      that collection won't find anything. Use the default
+      collection if you need indexes today.
+    - `runOptimistic` validates against the default tree's root
+      only — OCC for created collections is broken.
+    Plain CRUD (`insert` / `get` / `delete`) and lock-free
+    snapshot reads through `Snapshot.collection(name).get(id)`
+    work correctly for created collections.
+
 - Keyspace sharding, phase 2B: actual per-collection tree routing,
   end to end. No public API yet — `Db.collection(name)` still
   resolves every name to the default tree — but every layer below
