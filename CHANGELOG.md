@@ -8,6 +8,53 @@ tag goes under `## Unreleased`.
 ## Unreleased
 
 ### Added
+- Phase 6: **batched insert API** + **native encode**.
+
+  `Collection.insert_many(docs)` wraps N inserts in one
+  transaction — single per-collection WRITER fcntl, single WAL
+  flush, single fsync. C ABI:
+
+      pyx_insert_many(db, coll, len, docs_buf, docs_buf_len,
+                      doc_lens, n_docs, out_ids)
+
+  Caller passes a packed `docs_buf` (concatenated encoded docs)
+  plus a `doc_lens[n_docs]` array; libpyx slices internally and
+  feeds them to `Collection.insertMany` which assigns ids and
+  performs the single-commit cycle.
+
+  Pure-Zig insert_many alone gives a ~18× speedup vs `insert` in
+  a loop, but profiling showed `_doc.encode` at 74% of the
+  remaining time. Phase 6 adds **native encode** to `_native.c`:
+
+      _native.encode(doc) -> bytes
+      _native.encode_many(docs) -> (bytes, list[int])
+
+  `encode_many` builds one packed bytes buffer + a per-doc lens
+  list in a single C call — Python `insert_many` feeds those
+  straight into ctypes via `from_buffer_copy`, no per-doc
+  encode loop. `_doc.encode` also routes through native when
+  available, so single-doc `insert` benefits too.
+
+  OverflowError → ValueError translation in the C encoder so
+  i64-range checks match the pure-Python encoder's behaviour.
+
+  Bench delta (5000-doc bulk insert):
+
+      W1  seq inserts:          31 kops/s   (unchanged — autocommit)
+      W1b zig-only insert_many:    534 kops/s   (vs SQLite 3.06 Mops/s)
+      W1b + native encode_many:  1830 kops/s   (vs SQLite 3.00 Mops/s,
+                                               ratio 0.61x)
+
+  Final pyx-vs-sqlite ratios:
+      W1  seq inserts:    0.87x
+      W1b bulk insert:    0.61x   ← phase 6
+      W2  random reads:   0.43x
+      W2b batched reads:  0.63x
+      W3  multi-coll:     1.57x   (pyx faster — phase 3 win)
+      W4  shared coll:    1.09x
+
+  41 Python tests still pass.
+
 - Phase 5A: **sorted-scan in `Collection.getMany`**. Above 128 ids per
   call the implementation sorts the input ids, opens a single
   iterator at the smallest id's encoded key, and walks forward

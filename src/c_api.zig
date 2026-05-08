@@ -325,6 +325,56 @@ export fn pyx_insert(
     return status_ok;
 }
 
+/// Batched insert (phase 6) — N docs in one transaction (one fcntl
+/// lock cycle, one WAL flush, one fsync). Inputs:
+///
+///   docs_buf   : packed encoded docs, no separators
+///   doc_lens   : per-doc length in bytes (caller supplies; sum ==
+///                buffer length)
+///   n_docs     : number of docs
+///
+/// Output:
+///   out_ids[n_docs] — caller-allocated u64 array, filled with the
+///   doc id assigned to each input doc in order.
+export fn pyx_insert_many(
+    db: ?*State,
+    coll: ?[*]const u8, coll_len: usize,
+    docs_buf: ?[*]const u8, docs_buf_len: usize,
+    doc_lens: ?[*]const u32,
+    n_docs: usize,
+    out_ids: ?[*]u64,
+) c_int {
+    const s = db orelse return status_invalid_arg;
+    const c = nameSliceFromCArg(coll, coll_len) orelse return status_invalid_arg;
+    if (n_docs == 0) return status_ok;
+    const buf_ptr = docs_buf orelse return status_invalid_arg;
+    const lens_ptr = doc_lens orelse return status_invalid_arg;
+    const ids_ptr = out_ids orelse return status_invalid_arg;
+
+    // Slice up the packed buffer into per-doc views.
+    const slices = s.allocator.alloc([]const u8, n_docs) catch |err| {
+        setLastError("pyx_insert_many: {t}", .{err});
+        return statusFromError(err);
+    };
+    defer s.allocator.free(slices);
+    var offset: usize = 0;
+    var i: usize = 0;
+    while (i < n_docs) : (i += 1) {
+        const ln: usize = lens_ptr[i];
+        if (offset + ln > docs_buf_len) {
+            setLastError("pyx_insert_many: doc_lens exceeds docs_buf at index {}", .{i});
+            return status_invalid_arg;
+        }
+        slices[i] = buf_ptr[offset .. offset + ln];
+        offset += ln;
+    }
+    s.db.collection(c).insertMany(slices, ids_ptr[0..n_docs]) catch |err| {
+        setLastError("pyx_insert_many: {t}", .{err});
+        return statusFromError(err);
+    };
+    return status_ok;
+}
+
 export fn pyx_put(
     db: ?*State,
     coll: ?[*]const u8, coll_len: usize,

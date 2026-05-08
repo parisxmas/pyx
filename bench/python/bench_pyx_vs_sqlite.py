@@ -109,6 +109,42 @@ def w1_sqlite(path: str, n: int) -> float:
     return elapsed
 
 
+def w1b_pyx(path: str, n: int) -> float:
+    """Same as w1_pyx but uses `Collection.insert_many` to wrap N
+    inserts in a single transaction (one fcntl lock cycle, one WAL
+    flush, one fsync)."""
+    cleanup(path)
+    db = pyx.Db.open(path)
+    c = db.collection("notes")
+    docs = [{"i": i, "title": f"note-{i}", "body": "lorem ipsum"} for i in range(n)]
+    t0 = time.perf_counter()
+    c.insert_many(docs)
+    elapsed = time.perf_counter() - t0
+    db.close()
+    cleanup(path)
+    return elapsed
+
+
+def w1b_sqlite(path: str, n: int) -> float:
+    """SQLite analogue: BEGIN; executemany N rows; COMMIT — one fsync."""
+    cleanup(path)
+    conn = open_sqlite(path)
+    conn.execute(
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, i INTEGER, title TEXT, body TEXT)"
+    )
+    rows = [(i, f"note-{i}", "lorem ipsum") for i in range(n)]
+    t0 = time.perf_counter()
+    conn.execute("BEGIN")
+    conn.executemany(
+        "INSERT INTO notes (i, title, body) VALUES (?, ?, ?)", rows
+    )
+    conn.execute("COMMIT")
+    elapsed = time.perf_counter() - t0
+    conn.close()
+    cleanup(path)
+    return elapsed
+
+
 # ============================================================
 # W2 — Random reads from a pre-populated DB
 # ============================================================
@@ -394,6 +430,15 @@ def main() -> int:
             name="W1 seq inserts",
             pyx_s=w1_pyx(pyx_path, args.n_inserts),
             sqlite_s=w1_sqlite(sql_path, args.n_inserts),
+            pyx_ops=args.n_inserts,
+            sqlite_ops=args.n_inserts,
+        ))
+
+        print(f"W1b — batched bulk insert (one txn for n={args.n_inserts})...")
+        results.append(Result(
+            name="W1b bulk insert",
+            pyx_s=w1b_pyx(pyx_path, args.n_inserts),
+            sqlite_s=w1b_sqlite(sql_path, args.n_inserts),
             pyx_ops=args.n_inserts,
             sqlite_ops=args.n_inserts,
         ))

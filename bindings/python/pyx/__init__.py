@@ -363,6 +363,43 @@ class Collection:
         ))
         return int(out.value)
 
+    def insert_many(self, docs) -> list[int]:
+        """Insert N documents in one transaction. Returns the list of
+        assigned doc ids in input order. Significantly faster than
+        ``insert`` in a loop for bulk loading because the per-commit
+        costs (fcntl lock cycle, WAL flush, fsync) are paid ONCE for
+        the whole batch instead of per row.
+
+        Note that durability semantics differ from a per-row insert
+        loop: if the process crashes mid-batch, either ALL of the
+        batch is durable (we got past the fsync) or NONE of it is.
+        Use this for bulk imports / migrations; use ``insert`` when
+        you want each row durable on its own commit.
+        """
+        # Native encode-many produces (packed_bytes, lens_list) in one
+        # C call — no Python-level encode loop. Falls back to the
+        # pure-Python encoder when the C extension isn't available.
+        if _native_mod is not None:
+            packed, lens_list = _native_mod.encode_many(docs)
+            n = len(lens_list)
+            if n == 0:
+                return []
+        else:
+            encoded = [_doc.encode(d) for d in docs]
+            n = len(encoded)
+            if n == 0:
+                return []
+            packed = b"".join(encoded)
+            lens_list = [len(e) for e in encoded]
+        buf = (C.c_uint8 * len(packed)).from_buffer_copy(packed)
+        lens = (C.c_uint32 * n)(*lens_list)
+        out_ids = (C.c_uint64 * n)()
+        _check(_ffi.pyx_insert_many(
+            self._db._handle, self._name_bytes, len(self._name_bytes),
+            buf, len(packed), lens, n, out_ids,
+        ))
+        return [int(x) for x in out_ids]
+
     def put(self, doc_id: int, doc: dict) -> None:
         arr, n = _doc_to_bytes(doc)
         _check(_ffi.pyx_put(

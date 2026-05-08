@@ -184,6 +184,16 @@ pyx_delete = _bind(
     C.c_void_p, C.c_char_p, C.c_size_t, C.c_uint64,
 )
 
+# Batched insert (phase 6)
+pyx_insert_many = _bind(
+    "pyx_insert_many",
+    C.c_int,
+    C.c_void_p, C.c_char_p, C.c_size_t,
+    C.POINTER(C.c_uint8), C.c_size_t,
+    C.POINTER(C.c_uint32), C.c_size_t,
+    C.POINTER(C.c_uint64),
+)
+
 # Batched get (phase 4)
 pyx_get_many = _bind(
     "pyx_get_many",

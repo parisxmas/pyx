@@ -666,6 +666,38 @@ pub const Collection = struct {
         return doc_id;
     }
 
+    /// Batched insert (phase 6): wrap N inserts in a single
+    /// `pager.begin → applyAndFinalize → syncTo` cycle. Costs that
+    /// were paid per-insert (per-collection WRITER fcntl, WAL append
+    /// fcntl, single fsync) are paid ONCE for the whole batch. Net
+    /// effect on bulk-load workloads: roughly 1 / N the fixed cost.
+    /// Allocates `out_ids.len` doc ids and writes them in input order.
+    /// Caller must size `out_ids` to match `docs.len`.
+    pub fn insertMany(
+        self: Collection,
+        docs: []const []const u8,
+        out_ids: []u64,
+    ) !void {
+        std.debug.assert(docs.len == out_ids.len);
+        try validateName(self.name);
+        if (docs.len == 0) return;
+        if (self.db.ownsTxn()) {
+            for (docs, out_ids) |doc, *out| out.* = try self.insertLocked(doc);
+            return;
+        }
+        var commit_lsn: u64 = 0;
+        {
+            self.db.mu.lockUncancelable(self.db.pager.io);
+            defer self.db.mu.unlock(self.db.pager.io);
+            try self.db.pager.begin(self.id);
+            errdefer self.db.pager.abort();
+            for (docs, out_ids) |doc, *out| out.* = try self.insertLocked(doc);
+            commit_lsn = try self.db.pager.commitAppend();
+            try self.db.pager.applyAndFinalize();
+        }
+        try self.db.pager.syncTo(commit_lsn);
+    }
+
     pub fn put(self: Collection, doc_id: u64, doc_bytes: []const u8) !void {
         try validateName(self.name);
         if (self.db.ownsTxn()) return self.putLocked(doc_id, doc_bytes);

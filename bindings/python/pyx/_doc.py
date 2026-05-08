@@ -74,6 +74,21 @@ def _read_varint(buf: bytes, pos: int) -> tuple[int, int]:
 
 def encode(doc: dict) -> bytes:
     """Encode a Python dict into a pyx binary document."""
+    if _encode_native is not None:
+        return _encode_native(doc)
+    if not isinstance(doc, dict):
+        raise TypeError("top-level document must be a dict")
+    body = _encode_object_body(doc)
+    out = bytearray()
+    out.append(TAG_OBJECT)
+    out.extend(len(body).to_bytes(4, "little"))
+    out.extend(body)
+    return bytes(out)
+
+
+def _encode_pure_python(doc: dict) -> bytes:
+    """The pure-Python fallback. Kept callable for tests/benchmarks
+    even when the native extension is loaded."""
     if not isinstance(doc, dict):
         raise TypeError("top-level document must be a dict")
     body = _encode_object_body(doc)
@@ -178,8 +193,10 @@ def _write_value_payload(buf: bytearray, tag: int, value) -> None:
 try:
     from . import _native as _native_mod  # type: ignore
     _decode_native = _native_mod.decode
+    _encode_native = _native_mod.encode
 except ImportError:
     _decode_native = None  # extension unavailable; fall through to Python
+    _encode_native = None
 
 
 def decode(data: bytes) -> dict:
