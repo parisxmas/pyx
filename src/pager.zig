@@ -343,19 +343,24 @@ pub const Pager = struct {
         return commit_lsn;
     }
 
-    /// Phase-1 helper. Make every commit up to `lsn` durable on disk.
-    /// No-op in `.normal` mode (fsync is deferred to `checkpoint`) and
-    /// during recovery (records being replayed are already on disk).
+    /// Make every commit up to `lsn` durable on disk. No-op in `.normal`
+    /// mode (fsync is deferred to `checkpoint`) and during recovery
+    /// (records being replayed are already on disk).
     ///
-    /// `lsn` is currently unused — phase 1 always issues a fresh fsync
-    /// in `.full` mode. Phase 3 will track the watermark to short-circuit
-    /// followers whose commits were already covered by an earlier
-    /// leader's fsync.
+    /// Lock-free with respect to the data lock: callers may release
+    /// `db.mu` before invoking this. Calls `wal.fsync` (fsync only — no
+    /// flush of the staging buffer), so there is no race against another
+    /// thread's `commitAppend` running under the lock.
+    ///
+    /// `lsn` is currently unused — every call issues a fresh fsync in
+    /// `.full` mode. Phase 3 will track a fsynced-LSN watermark and
+    /// short-circuit followers whose commits were already covered by an
+    /// earlier leader's fsync.
     pub fn syncTo(self: *Pager, lsn: u64) !void {
         _ = lsn;
         if (self.in_recovery) return;
         if (self.sync_mode != .full) return;
-        try self.wal.sync();
+        try self.wal.fsync();
     }
 
     /// Phase-1 helper. Move dirty pages into the page cache and reset the

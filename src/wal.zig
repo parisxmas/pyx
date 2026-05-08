@@ -193,6 +193,16 @@ pub const Wal = struct {
         try self.file.sync(self.io);
     }
 
+    /// fsync the WAL file without first flushing the staging buffer. Safe
+    /// to call from a thread that does NOT hold the writer's data lock,
+    /// provided the caller has guaranteed (via that lock) that every
+    /// record they need durable was already pushed to the kernel by an
+    /// earlier `flush()`. Used by the group-commit path: writers flush
+    /// under the lock, release the lock, then race here for the fsync.
+    pub fn fsync(self: *Wal) !void {
+        try self.file.sync(self.io);
+    }
+
     pub fn reset(self: *Wal) !void {
         self.pending.clearRetainingCapacity();
         try self.file.setLength(self.io, wal_header_size);

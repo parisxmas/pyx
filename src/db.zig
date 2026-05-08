@@ -195,8 +195,13 @@ pub const Db = struct {
     }
     pub fn commit(self: *Db) !void {
         self.txn_owner.store(0, .release);
-        defer self.mu.unlock(self.pager.io);
-        try self.pager.commit();
+        const commit_lsn = blk: {
+            defer self.mu.unlock(self.pager.io);
+            const lsn = try self.pager.commitAppend();
+            try self.pager.applyAndFinalize();
+            break :blk lsn;
+        };
+        try self.pager.syncTo(commit_lsn);
     }
     pub fn abort(self: *Db) void {
         self.txn_owner.store(0, .release);
@@ -270,12 +275,17 @@ pub const Db = struct {
             try self.indexes.createIndex(&self.pager, coll, field_path);
             return;
         }
-        self.mu.lockUncancelable(self.pager.io);
-        defer self.mu.unlock(self.pager.io);
-        try self.pager.begin();
-        errdefer self.pager.abort();
-        try self.indexes.createIndex(&self.pager, coll, field_path);
-        try self.pager.commit();
+        const commit_lsn = blk: {
+            self.mu.lockUncancelable(self.pager.io);
+            defer self.mu.unlock(self.pager.io);
+            try self.pager.begin();
+            errdefer self.pager.abort();
+            try self.indexes.createIndex(&self.pager, coll, field_path);
+            const lsn = try self.pager.commitAppend();
+            try self.pager.applyAndFinalize();
+            break :blk lsn;
+        };
+        try self.pager.syncTo(commit_lsn);
     }
 
     pub fn dropIndex(self: *Db, coll: []const u8, field_path: []const u8) !void {
@@ -284,12 +294,17 @@ pub const Db = struct {
             try self.indexes.dropIndex(&self.pager, coll, field_path);
             return;
         }
-        self.mu.lockUncancelable(self.pager.io);
-        defer self.mu.unlock(self.pager.io);
-        try self.pager.begin();
-        errdefer self.pager.abort();
-        try self.indexes.dropIndex(&self.pager, coll, field_path);
-        try self.pager.commit();
+        const commit_lsn = blk: {
+            self.mu.lockUncancelable(self.pager.io);
+            defer self.mu.unlock(self.pager.io);
+            try self.pager.begin();
+            errdefer self.pager.abort();
+            try self.indexes.dropIndex(&self.pager, coll, field_path);
+            const lsn = try self.pager.commitAppend();
+            try self.pager.applyAndFinalize();
+            break :blk lsn;
+        };
+        try self.pager.syncTo(commit_lsn);
     }
 };
 
@@ -304,12 +319,18 @@ pub const Collection = struct {
     pub fn insert(self: Collection, doc_bytes: []const u8) !u64 {
         try validateName(self.name);
         if (self.db.ownsTxn()) return self.insertLocked(doc_bytes);
-        self.db.mu.lockUncancelable(self.db.pager.io);
-        defer self.db.mu.unlock(self.db.pager.io);
-        try self.db.pager.begin();
-        errdefer self.db.pager.abort();
-        const id = try self.insertLocked(doc_bytes);
-        try self.db.pager.commit();
+        var commit_lsn: u64 = 0;
+        const id = blk: {
+            self.db.mu.lockUncancelable(self.db.pager.io);
+            defer self.db.mu.unlock(self.db.pager.io);
+            try self.db.pager.begin();
+            errdefer self.db.pager.abort();
+            const inserted_id = try self.insertLocked(doc_bytes);
+            commit_lsn = try self.db.pager.commitAppend();
+            try self.db.pager.applyAndFinalize();
+            break :blk inserted_id;
+        };
+        try self.db.pager.syncTo(commit_lsn);
         return id;
     }
 
@@ -325,12 +346,17 @@ pub const Collection = struct {
     pub fn put(self: Collection, doc_id: u64, doc_bytes: []const u8) !void {
         try validateName(self.name);
         if (self.db.ownsTxn()) return self.putLocked(doc_id, doc_bytes);
-        self.db.mu.lockUncancelable(self.db.pager.io);
-        defer self.db.mu.unlock(self.db.pager.io);
-        try self.db.pager.begin();
-        errdefer self.db.pager.abort();
-        try self.putLocked(doc_id, doc_bytes);
-        try self.db.pager.commit();
+        const commit_lsn = blk: {
+            self.db.mu.lockUncancelable(self.db.pager.io);
+            defer self.db.mu.unlock(self.db.pager.io);
+            try self.db.pager.begin();
+            errdefer self.db.pager.abort();
+            try self.putLocked(doc_id, doc_bytes);
+            const lsn = try self.db.pager.commitAppend();
+            try self.db.pager.applyAndFinalize();
+            break :blk lsn;
+        };
+        try self.db.pager.syncTo(commit_lsn);
     }
 
     fn putLocked(self: Collection, doc_id: u64, doc_bytes: []const u8) !void {
@@ -361,12 +387,18 @@ pub const Collection = struct {
     pub fn delete(self: Collection, doc_id: u64) !bool {
         try validateName(self.name);
         if (self.db.ownsTxn()) return self.deleteLocked(doc_id);
-        self.db.mu.lockUncancelable(self.db.pager.io);
-        defer self.db.mu.unlock(self.db.pager.io);
-        try self.db.pager.begin();
-        errdefer self.db.pager.abort();
-        const found = try self.deleteLocked(doc_id);
-        try self.db.pager.commit();
+        var commit_lsn: u64 = 0;
+        const found = blk: {
+            self.db.mu.lockUncancelable(self.db.pager.io);
+            defer self.db.mu.unlock(self.db.pager.io);
+            try self.db.pager.begin();
+            errdefer self.db.pager.abort();
+            const f = try self.deleteLocked(doc_id);
+            commit_lsn = try self.db.pager.commitAppend();
+            try self.db.pager.applyAndFinalize();
+            break :blk f;
+        };
+        try self.db.pager.syncTo(commit_lsn);
         return found;
     }
 
