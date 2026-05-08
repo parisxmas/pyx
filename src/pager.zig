@@ -283,7 +283,34 @@ pub const Pager = struct {
         self.in_txn = true;
     }
 
+    /// Commit pipeline, split into three phases so a future group-commit
+    /// implementation can release the data lock before fsync.
+    ///
+    ///   1. `commitAppend` — stage WAL records, single pwritev, no fsync.
+    ///      Returns the LSN of the COMMIT record (0 when called during
+    ///      recovery, where no WAL records are written).
+    ///   2. `syncTo(lsn)`  — fsync the WAL up to and including `lsn`.
+    ///      No-op in `.normal` mode and during recovery.
+    ///   3. `applyAndFinalize` — move dirty pages into the page cache,
+    ///      reset the per-txn state, drop `in_txn`.
+    ///
+    /// The unified `commit()` calls all three in order, preserving
+    /// pre-split behavior exactly (append → flush → fsync → cache-move).
+    /// Group commit (phase 3) will keep `commitAppend` and `applyAndFinalize`
+    /// under the data lock and call `syncTo` after the lock is released,
+    /// allowing fsyncs to coalesce across writers.
     pub fn commit(self: *Pager) !void {
+        const commit_lsn = try self.commitAppend();
+        try self.syncTo(commit_lsn);
+        try self.applyAndFinalize();
+    }
+
+    /// Phase-1 helper. Stages records into the WAL buffer, writes one
+    /// `pwritev` for the whole batch, and returns the COMMIT-record LSN.
+    /// Does NOT fsync; does NOT move dirty pages into the cache. Caller
+    /// must follow with `syncTo` and `applyAndFinalize` (or use the
+    /// unified `commit`).
+    pub fn commitAppend(self: *Pager) !u64 {
         if (!self.in_txn) return Error.NoActiveTxn;
 
         if (self.header_dirty) {
@@ -294,33 +321,50 @@ pub const Pager = struct {
             serializeHeader(self.header, gop.value_ptr.*);
         }
 
-        if (!self.in_recovery) {
-            // Stage all records into the WAL's in-memory buffer first; if
-            // any append fails we drop the partial batch and bail before
-            // touching disk.
-            errdefer self.wal.discardPending();
-            for (self.pending.items) |rec| {
-                switch (rec) {
-                    .put => |p| try self.wal.appendPut(self.next_lsn, p.key, p.value),
-                    .delete => |k| try self.wal.appendDelete(self.next_lsn, k),
-                }
-                self.next_lsn += 1;
-            }
-            try self.wal.appendCommit(self.next_lsn, self.header.next_doc_id);
-            self.next_lsn += 1;
-            // One pwritev for the whole batch (PUTs + COMMIT). Then fsync
-            // only when the user asked for `.full` durability — `.normal`
-            // mirrors SQLite WAL+NORMAL: WAL hits the kernel on commit,
-            // fsync is deferred until checkpoint.
-            try self.wal.flush();
-            if (self.sync_mode == .full) try self.wal.sync();
-        }
+        if (self.in_recovery) return 0;
 
-        // Move dirty pages into the page cache (no disk writes here).
-        // The cache is flushed at `checkpoint()` — that's where actual
-        // pwrites happen, batched. Ownership of each 4 KB buffer transfers
-        // from `dirty` to `page_cache`; if the same page is already in the
-        // cache (overridden by this txn), the old cached buffer is freed.
+        // Stage all records into the WAL's in-memory buffer first; if any
+        // append fails we drop the partial batch and bail before touching
+        // disk.
+        errdefer self.wal.discardPending();
+        for (self.pending.items) |rec| {
+            switch (rec) {
+                .put => |p| try self.wal.appendPut(self.next_lsn, p.key, p.value),
+                .delete => |k| try self.wal.appendDelete(self.next_lsn, k),
+            }
+            self.next_lsn += 1;
+        }
+        const commit_lsn = self.next_lsn;
+        try self.wal.appendCommit(commit_lsn, self.header.next_doc_id);
+        self.next_lsn += 1;
+        // One pwritev for the whole batch (PUTs + COMMIT). Records reach
+        // the kernel page cache here; durability is the next phase's job.
+        try self.wal.flush();
+        return commit_lsn;
+    }
+
+    /// Phase-1 helper. Make every commit up to `lsn` durable on disk.
+    /// No-op in `.normal` mode (fsync is deferred to `checkpoint`) and
+    /// during recovery (records being replayed are already on disk).
+    ///
+    /// `lsn` is currently unused — phase 1 always issues a fresh fsync
+    /// in `.full` mode. Phase 3 will track the watermark to short-circuit
+    /// followers whose commits were already covered by an earlier
+    /// leader's fsync.
+    pub fn syncTo(self: *Pager, lsn: u64) !void {
+        _ = lsn;
+        if (self.in_recovery) return;
+        if (self.sync_mode != .full) return;
+        try self.wal.sync();
+    }
+
+    /// Phase-1 helper. Move dirty pages into the page cache and reset the
+    /// per-txn state. The cache is flushed to disk by `checkpoint()`,
+    /// which is where the actual data-file pwrites happen, batched.
+    /// Ownership of each 4 KB buffer transfers from `dirty` to
+    /// `page_cache`; if the same page is already in the cache (overridden
+    /// by this txn), the old cached buffer is freed.
+    pub fn applyAndFinalize(self: *Pager) !void {
         var it = self.dirty.iterator();
         while (it.next()) |e| {
             const gop = try self.page_cache.getOrPut(self.allocator, e.key_ptr.*);
