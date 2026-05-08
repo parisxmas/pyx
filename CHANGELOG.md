@@ -43,7 +43,8 @@ tag goes under `## Unreleased`.
   here on.
 
 ### Changed
-- README benchmark tables refreshed for the latest run.
+- README benchmark tables refreshed against latest runs (twice in
+  this cycle); shape unchanged within run-to-run variance.
 - README Python quick-start showcases the new `find_range`
   ergonomics and includes an OCC `run_optimistic` example.
 - README concurrency-model section now describes phantom protection
