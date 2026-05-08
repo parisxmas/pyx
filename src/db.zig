@@ -533,8 +533,9 @@ pub const Db = struct {
 
     pub fn createIndex(self: *Db, coll: []const u8, field_path: []const u8) !void {
         try validateName(coll);
+        const cid = self.collections.get(coll) orelse pager_mod.default_collection_id;
         if (self.ownsTxn()) {
-            try self.indexes.createIndex(&self.pager, coll, field_path);
+            try self.indexes.createIndex(&self.pager, cid, coll, field_path);
             return;
         }
         const commit_lsn = blk: {
@@ -542,7 +543,7 @@ pub const Db = struct {
             defer self.mu.unlock(self.pager.io);
             try self.pager.begin();
             errdefer self.pager.abort();
-            try self.indexes.createIndex(&self.pager, coll, field_path);
+            try self.indexes.createIndex(&self.pager, cid, coll, field_path);
             const lsn = try self.pager.commitAppend();
             try self.pager.applyAndFinalize();
             break :blk lsn;
@@ -552,8 +553,9 @@ pub const Db = struct {
 
     pub fn dropIndex(self: *Db, coll: []const u8, field_path: []const u8) !void {
         try validateName(coll);
+        const cid = self.collections.get(coll) orelse pager_mod.default_collection_id;
         if (self.ownsTxn()) {
-            try self.indexes.dropIndex(&self.pager, coll, field_path);
+            try self.indexes.dropIndex(&self.pager, cid, coll, field_path);
             return;
         }
         const commit_lsn = blk: {
@@ -561,7 +563,7 @@ pub const Db = struct {
             defer self.mu.unlock(self.pager.io);
             try self.pager.begin();
             errdefer self.pager.abort();
-            try self.indexes.dropIndex(&self.pager, coll, field_path);
+            try self.indexes.dropIndex(&self.pager, cid, coll, field_path);
             const lsn = try self.pager.commitAppend();
             try self.pager.applyAndFinalize();
             break :blk lsn;
@@ -574,8 +576,9 @@ pub const Db = struct {
     /// only the former answers `last="X" AND first="Y"` lookups.
     pub fn createCompoundIndex(self: *Db, coll: []const u8, fields: []const []const u8) !void {
         try validateName(coll);
+        const cid = self.collections.get(coll) orelse pager_mod.default_collection_id;
         if (self.ownsTxn()) {
-            try self.indexes.createCompoundIndex(&self.pager, coll, fields);
+            try self.indexes.createCompoundIndex(&self.pager, cid, coll, fields);
             return;
         }
         const commit_lsn = blk: {
@@ -583,7 +586,7 @@ pub const Db = struct {
             defer self.mu.unlock(self.pager.io);
             try self.pager.begin();
             errdefer self.pager.abort();
-            try self.indexes.createCompoundIndex(&self.pager, coll, fields);
+            try self.indexes.createCompoundIndex(&self.pager, cid, coll, fields);
             const lsn = try self.pager.commitAppend();
             try self.pager.applyAndFinalize();
             break :blk lsn;
@@ -593,8 +596,9 @@ pub const Db = struct {
 
     pub fn dropCompoundIndex(self: *Db, coll: []const u8, fields: []const []const u8) !void {
         try validateName(coll);
+        const cid = self.collections.get(coll) orelse pager_mod.default_collection_id;
         if (self.ownsTxn()) {
-            try self.indexes.dropCompoundIndex(&self.pager, coll, fields);
+            try self.indexes.dropCompoundIndex(&self.pager, cid, coll, fields);
             return;
         }
         const commit_lsn = blk: {
@@ -602,7 +606,7 @@ pub const Db = struct {
             defer self.mu.unlock(self.pager.io);
             try self.pager.begin();
             errdefer self.pager.abort();
-            try self.indexes.dropCompoundIndex(&self.pager, coll, fields);
+            try self.indexes.dropCompoundIndex(&self.pager, cid, coll, fields);
             const lsn = try self.pager.commitAppend();
             try self.pager.applyAndFinalize();
             break :blk lsn;
@@ -643,7 +647,7 @@ pub const Collection = struct {
         var key_buf: [max_full_key_size]u8 = undefined;
         const key_len = encodeKey(&key_buf, self.name, doc_id);
         try self.btree().put(key_buf[0..key_len], doc_bytes);
-        try self.db.indexes.afterInsert(&self.db.pager, self.name, doc_id, doc_bytes);
+        try self.db.indexes.afterInsert(&self.db.pager, self.id, self.name, doc_id, doc_bytes);
         return doc_id;
     }
 
@@ -672,10 +676,10 @@ pub const Collection = struct {
         const bt = self.btree();
         const old = try bt.get(self.db.allocator, key_buf[0..key_len]);
         defer if (old) |o| self.db.allocator.free(o);
-        if (old) |o| try self.db.indexes.beforeDelete(&self.db.pager, self.name, doc_id, o);
+        if (old) |o| try self.db.indexes.beforeDelete(&self.db.pager, self.id, self.name, doc_id, o);
 
         try bt.put(key_buf[0..key_len], doc_bytes);
-        try self.db.indexes.afterInsert(&self.db.pager, self.name, doc_id, doc_bytes);
+        try self.db.indexes.afterInsert(&self.db.pager, self.id, self.name, doc_id, doc_bytes);
     }
 
     pub fn get(self: Collection, allocator: Allocator, doc_id: u64) !?[]u8 {
@@ -713,7 +717,7 @@ pub const Collection = struct {
         const old = try bt.get(self.db.allocator, key_buf[0..key_len]);
         defer if (old) |o| self.db.allocator.free(o);
         if (old == null) return false;
-        try self.db.indexes.beforeDelete(&self.db.pager, self.name, doc_id, old.?);
+        try self.db.indexes.beforeDelete(&self.db.pager, self.id, self.name, doc_id, old.?);
         return bt.delete(key_buf[0..key_len]);
     }
 
@@ -744,7 +748,7 @@ pub const Collection = struct {
         const locked = !self.db.ownsTxn();
         if (locked) self.db.mu.lockUncancelable(self.db.pager.io);
         defer if (locked) self.db.mu.unlock(self.db.pager.io);
-        return self.db.indexes.findOne(&self.db.pager, self.name, field_path, value) catch |err| switch (err) {
+        return self.db.indexes.findOne(&self.db.pager, self.id, self.name, field_path, value) catch |err| switch (err) {
             error.NoSuchIndex => Error.NoSuchIndex,
             else => err,
         };
@@ -762,7 +766,7 @@ pub const Collection = struct {
         const locked = !self.db.ownsTxn();
         if (locked) self.db.mu.lockUncancelable(self.db.pager.io);
         defer if (locked) self.db.mu.unlock(self.db.pager.io);
-        return self.db.indexes.findOneCompound(&self.db.pager, self.name, fields, values) catch |err| switch (err) {
+        return self.db.indexes.findOneCompound(&self.db.pager, self.id, self.name, fields, values) catch |err| switch (err) {
             error.NoSuchIndex => Error.NoSuchIndex,
             else => err,
         };
@@ -782,7 +786,7 @@ pub const Collection = struct {
         const locked = !self.db.ownsTxn();
         if (locked) self.db.mu.lockUncancelable(self.db.pager.io);
         defer if (locked) self.db.mu.unlock(self.db.pager.io);
-        return self.db.indexes.findRange(allocator, &self.db.pager, self.name, field_path, lo, hi) catch |err| switch (err) {
+        return self.db.indexes.findRange(allocator, &self.db.pager, self.id, self.name, field_path, lo, hi) catch |err| switch (err) {
             error.NoSuchIndex => Error.NoSuchIndex,
             else => err,
         };
@@ -799,7 +803,7 @@ pub const Collection = struct {
         const locked = !self.db.ownsTxn();
         if (locked) self.db.mu.lockUncancelable(self.db.pager.io);
         defer if (locked) self.db.mu.unlock(self.db.pager.io);
-        return self.db.indexes.findAll(allocator, &self.db.pager, self.name, field_path, value) catch |err| switch (err) {
+        return self.db.indexes.findAll(allocator, &self.db.pager, self.id, self.name, field_path, value) catch |err| switch (err) {
             error.NoSuchIndex => Error.NoSuchIndex,
             else => err,
         };
@@ -3359,4 +3363,68 @@ test "sharding 2C: created-collection data is isolated from default" {
     }
     try testing.expect((try snap.collection("notes").get(ally, orders_id)) == null);
     try testing.expect((try snap.collection("orders").get(ally, default_id)) == null);
+}
+
+test "phase 2C limitations: OCC on a created collection — does it actually break?" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-nondefault.pyx");
+    defer db.close();
+
+    _ = try db.createCollection("widgets");
+
+    // Seed one doc via auto-commit so OCC has something to read.
+    const seed_id = try db.collection("widgets").insert("{\"v\":1}");
+
+    // Run an OCC txn that reads + writes on the created collection.
+    const Args = struct { db: *Db, doc_id: u64, allocator: Allocator };
+    const args = Args{ .db = &db, .doc_id = seed_id, .allocator = ally };
+    try db.runOptimistic(8, args, struct {
+        fn run(a: Args, txn: *OptimisticTxn) !void {
+            const c = txn.collection("widgets");
+            const v = try c.get(a.allocator, a.doc_id);
+            defer if (v) |vv| a.allocator.free(vv);
+            try c.put(a.doc_id, "{\"v\":2}");
+        }
+    }.run);
+
+    // Verify the OCC write landed in the WIDGETS tree, not the default.
+    {
+        const v = (try db.collection("widgets").get(ally, seed_id)).?;
+        defer ally.free(v);
+        try testing.expect(std.mem.indexOf(u8, v, "\"v\":2") != null);
+    }
+    // Default tree should NOT have a doc at seed_id.
+    try testing.expect((try db.collection("notes").get(ally, seed_id)) == null);
+}
+
+test "sharding 2C-fix: createIndex on a created collection actually indexes its docs" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+
+    var db = try Db.open(ally, testing.io, tmp.dir, "idx-nondefault.pyx");
+    defer db.close();
+
+    _ = try db.createCollection("users");
+    const u = db.collection("users");
+
+    const alice = try buildDoc("alice", 1);
+    defer ally.free(alice);
+    _ = try u.insert(alice);
+    const bob = try buildDoc("bob", 2);
+    defer ally.free(bob);
+    const bob_id = try u.insert(bob);
+    const carol = try buildDoc("carol", 3);
+    defer ally.free(carol);
+    _ = try u.insert(carol);
+
+    try db.createIndex("users", "name");
+
+    // findOne uses the index. After the fix, the index entries live in
+    // the "users" tree alongside the docs, so the lookup returns bob.
+    const found = try u.findOne("name", .{ .string = "bob" });
+    try testing.expectEqual(@as(?u64, bob_id), found);
 }

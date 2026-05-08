@@ -7,6 +7,33 @@ tag goes under `## Unreleased`.
 
 ## Unreleased
 
+### Fixed
+- Sharding: indexes on created collections actually work now. The
+  0.4.0 limitation was that `createIndex` / `createCompoundIndex`
+  scanned the **default** tree for docs to index and wrote entries
+  there too, so a `findOne` on a created collection always missed
+  (no entries had been built; the docs lived in the per-collection
+  tree). Threaded `CollectionId` through every public method of
+  `Indexes.Manager` (`createIndex`, `dropIndex`,
+  `createCompoundIndex`, `dropCompoundIndex`, `afterInsert`,
+  `beforeDelete`, `findOne`, `findOneCompound`, `findRange`,
+  `findAll`); the registry stays in the default tree (one global
+  registry of "what indexes exist") but index entries now live in
+  the same tree as the docs they index. So a snapshot of a
+  collection is internally consistent w.r.t. its own indexes.
+  Also fixed a pre-existing double-free in `createIndex` /
+  `createCompoundIndex` — `errdefer def.deinit` stayed active
+  after `self.indexes.append` took ownership; reordered append
+  to the end so the errdefer covers only its own allocations.
+- Sharding: while we're at it, also verified that **OCC on a
+  created collection already works** in 0.4.0. The phase 2C
+  release notes called it out as broken, but it isn't: every
+  read/write inside an `OptimisticTxn` routes through
+  `db.collection(name)` / `snapshot.collection(name)`, both of
+  which consult the catalog cache and resolve to the right id.
+  New test `phase 2C limitations: OCC on a created collection
+  — does it actually break?` passes with no code change.
+
 ## 0.4.0 — 2026-05-08
 
 The headline of 0.4.0 is **keyspace sharding** — opt-in, per-name

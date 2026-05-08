@@ -161,14 +161,18 @@ pub const Manager = struct {
 
     /// Hook called after a primary insert. Adds index entries for each
     /// matching active index whose field is present and supported.
+    /// `collection_id` is the tree the doc was inserted into; index
+    /// entries live in the same tree so a snapshot of that collection
+    /// is internally consistent w.r.t. its indexes.
     pub fn afterInsert(
         self: *Manager,
         pager: *pager_mod.Pager,
+        collection_id: pager_mod.CollectionId,
         coll: []const u8,
         doc_id: u64,
         doc_bytes: []const u8,
     ) !void {
-        const bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
+        const bt = btree_mod.BTree.init(self.allocator, pager, collection_id);
         for (self.indexes.items) |def| {
             if (!def.matches(coll)) continue;
             try addIndexEntry(self.allocator, bt, def, doc_id, doc_bytes);
@@ -184,11 +188,12 @@ pub const Manager = struct {
     pub fn beforeDelete(
         self: *Manager,
         pager: *pager_mod.Pager,
+        collection_id: pager_mod.CollectionId,
         coll: []const u8,
         doc_id: u64,
         old_doc: []const u8,
     ) !void {
-        const bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
+        const bt = btree_mod.BTree.init(self.allocator, pager, collection_id);
         for (self.indexes.items) |def| {
             if (!def.matches(coll)) continue;
             try removeIndexEntry(self.allocator, bt, def, doc_id, old_doc);
@@ -211,6 +216,7 @@ pub const Manager = struct {
     pub fn createIndex(
         self: *Manager,
         pager: *pager_mod.Pager,
+        collection_id: pager_mod.CollectionId,
         coll: []const u8,
         field: []const u8,
     ) !void {
@@ -221,7 +227,12 @@ pub const Manager = struct {
             if (def.matches(coll) and mem.eql(u8, def.field_path, field)) return;
         }
 
-        const bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
+        // Registry is global — one entry per (coll, field) pair, in the
+        // default tree. Index entries (added in phase 3) live in the
+        // collection's own tree so a per-collection snapshot is
+        // internally consistent.
+        const registry_bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
+        const entry_bt = btree_mod.BTree.init(self.allocator, pager, collection_id);
 
         // Phase 1: scan upfront, dupe each value so it survives subsequent
         // tree mutations.
@@ -234,7 +245,7 @@ pub const Manager = struct {
 
         var prefix_buf: [max_index_key_size]u8 = undefined;
         const prefix_len = encodeCollectionPrefix(&prefix_buf, coll);
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(collection_id) };
         {
             var it = try view.iteratorFrom(self.allocator, prefix_buf[0..prefix_len]);
             defer it.deinit();
@@ -249,28 +260,34 @@ pub const Manager = struct {
             }
         }
 
-        // Phase 2: write the registry entry.
+        // Phase 2: write the registry entry into the default tree.
         var key_buf: [max_index_key_size]u8 = undefined;
         const key_len = encodeRegistryKey(&key_buf, coll, field);
-        try bt.put(key_buf[0..key_len], &.{});
+        try registry_bt.put(key_buf[0..key_len], &.{});
 
         const def = IndexDef{
             .coll_name = try self.allocator.dupe(u8, coll),
             .field_path = try self.allocator.dupe(u8, field),
         };
         errdefer def.deinit(self.allocator);
-        try self.indexes.append(self.allocator, def);
 
         // Phase 3: insert index entries from the snapshot we collected.
+        // Entries live in the collection's own tree. Done BEFORE
+        // appending to self.indexes so a partial-failure path leaves a
+        // clean errdefer (no double-free between def.deinit and
+        // Manager.deinit).
         for (pairs.items) |p| {
-            try addIndexEntry(self.allocator, bt, def, p.doc_id, p.value);
+            try addIndexEntry(self.allocator, entry_bt, def, p.doc_id, p.value);
         }
+
+        try self.indexes.append(self.allocator, def);
     }
 
     /// Drop an index: remove the registry entry and all its index entries.
     pub fn dropIndex(
         self: *Manager,
         pager: *pager_mod.Pager,
+        collection_id: pager_mod.CollectionId,
         coll: []const u8,
         field: []const u8,
     ) !void {
@@ -286,30 +303,31 @@ pub const Manager = struct {
         const removed = self.indexes.orderedRemove(found_idx.?);
         defer removed.deinit(self.allocator);
 
-        const bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
+        const registry_bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
+        const entry_bt = btree_mod.BTree.init(self.allocator, pager, collection_id);
 
-        // Remove registry entry.
+        // Remove registry entry from the default tree.
         var key_buf: [max_index_key_size]u8 = undefined;
         const key_len = encodeRegistryKey(&key_buf, coll, field);
-        _ = try bt.delete(key_buf[0..key_len]);
+        _ = try registry_bt.delete(key_buf[0..key_len]);
 
-        // Walk all index entries with our (coll, field) prefix and delete them.
+        // Walk all index entries with our (coll, field) prefix and delete
+        // them from the collection's tree.
         var prefix_buf: [max_index_key_size]u8 = undefined;
         const prefix_len = encodeIndexFieldPrefix(&prefix_buf, coll, field);
-        // Collect keys first (can't mutate while iterating).
         var to_delete: ArrayList([]u8) = .empty;
         defer {
             for (to_delete.items) |k| self.allocator.free(k);
             to_delete.deinit(self.allocator);
         }
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(collection_id) };
         var it = try view.iteratorFrom(self.allocator, prefix_buf[0..prefix_len]);
         defer it.deinit();
         while (try it.next()) |entry| {
             if (!startsWithPrefix(entry.key, prefix_buf[0..prefix_len])) break;
             try to_delete.append(self.allocator, try self.allocator.dupe(u8, entry.key));
         }
-        for (to_delete.items) |k| _ = try bt.delete(k);
+        for (to_delete.items) |k| _ = try entry_bt.delete(k);
     }
 
     /// Compound-index variant of `createIndex`. `fields` is the ordered
@@ -319,6 +337,7 @@ pub const Manager = struct {
     pub fn createCompoundIndex(
         self: *Manager,
         pager: *pager_mod.Pager,
+        collection_id: pager_mod.CollectionId,
         coll: []const u8,
         fields: []const []const u8,
     ) !void {
@@ -330,7 +349,8 @@ pub const Manager = struct {
             if (def.matches(coll) and def.fieldsEql(fields)) return;
         }
 
-        const bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
+        const registry_bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
+        const entry_bt = btree_mod.BTree.init(self.allocator, pager, collection_id);
 
         // Phase 1: snapshot the collection's primary entries before any
         // writes, so subsequent index inserts can't perturb our scan.
@@ -342,7 +362,7 @@ pub const Manager = struct {
         }
         var prefix_buf: [max_index_key_size]u8 = undefined;
         const prefix_len = encodeCollectionPrefix(&prefix_buf, coll);
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(collection_id) };
         {
             var it = try view.iteratorFrom(self.allocator, prefix_buf[0..prefix_len]);
             defer it.deinit();
@@ -357,7 +377,7 @@ pub const Manager = struct {
             }
         }
 
-        // Phase 2: build the def, write the registry entry.
+        // Phase 2: build the def, write the registry entry to default tree.
         const owned_fields = try self.allocator.alloc([]u8, fields.len);
         errdefer self.allocator.free(owned_fields);
         var allocated: usize = 0;
@@ -374,20 +394,24 @@ pub const Manager = struct {
 
         var key_buf: [max_index_key_size]u8 = undefined;
         const key_len = try encodeCompoundRegistryKey(&key_buf, coll, fields);
-        try bt.put(key_buf[0..key_len], &.{});
+        try registry_bt.put(key_buf[0..key_len], &.{});
+
+        // Phase 3: index the snapshot. Entries go in the per-collection
+        // tree. Done BEFORE appending to self.compound for the same
+        // reason as createIndex — a partial-failure path leaves a
+        // clean errdefer.
+        for (pairs.items) |p| {
+            try addCompoundIndexEntry(self.allocator, entry_bt, def, p.doc_id, p.value);
+        }
 
         try self.compound.append(self.allocator, def);
-
-        // Phase 3: index the snapshot.
-        for (pairs.items) |p| {
-            try addCompoundIndexEntry(self.allocator, bt, def, p.doc_id, p.value);
-        }
     }
 
     /// Drop a compound index by exact-match field list.
     pub fn dropCompoundIndex(
         self: *Manager,
         pager: *pager_mod.Pager,
+        collection_id: pager_mod.CollectionId,
         coll: []const u8,
         fields: []const []const u8,
     ) !void {
@@ -402,14 +426,14 @@ pub const Manager = struct {
         const removed = self.compound.orderedRemove(found_idx.?);
         defer removed.deinit(self.allocator);
 
-        const bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
+        const registry_bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
+        const entry_bt = btree_mod.BTree.init(self.allocator, pager, collection_id);
 
         var key_buf: [max_index_key_size]u8 = undefined;
         const key_len = try encodeCompoundRegistryKey(&key_buf, coll, fields);
-        _ = try bt.delete(key_buf[0..key_len]);
+        _ = try registry_bt.delete(key_buf[0..key_len]);
 
-        // Walk the entry namespace prefixed by (\x04, coll, N, fields) and
-        // delete each.
+        // Walk the entry namespace in the collection's tree.
         var prefix_buf: [max_index_key_size]u8 = undefined;
         const prefix_len = try encodeCompoundEntryFieldsPrefix(&prefix_buf, coll, fields);
         var to_delete: ArrayList([]u8) = .empty;
@@ -417,14 +441,14 @@ pub const Manager = struct {
             for (to_delete.items) |k| self.allocator.free(k);
             to_delete.deinit(self.allocator);
         }
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(collection_id) };
         var it = try view.iteratorFrom(self.allocator, prefix_buf[0..prefix_len]);
         defer it.deinit();
         while (try it.next()) |entry| {
             if (!startsWithPrefix(entry.key, prefix_buf[0..prefix_len])) break;
             try to_delete.append(self.allocator, try self.allocator.dupe(u8, entry.key));
         }
-        for (to_delete.items) |k| _ = try bt.delete(k);
+        for (to_delete.items) |k| _ = try entry_bt.delete(k);
     }
 
     pub fn hasCompoundIndex(self: *const Manager, coll: []const u8, fields: []const []const u8) bool {
@@ -439,11 +463,12 @@ pub const Manager = struct {
     pub fn findOneCompound(
         self: *const Manager,
         pager: *pager_mod.Pager,
+        collection_id: pager_mod.CollectionId,
         coll: []const u8,
         fields: []const []const u8,
         values: []const doc_mod.Value,
     ) !?u64 {
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(collection_id) };
         return self.findOneCompoundInView(view, coll, fields, values);
     }
 
@@ -472,11 +497,12 @@ pub const Manager = struct {
     pub fn findOne(
         self: *const Manager,
         pager: *pager_mod.Pager,
+        collection_id: pager_mod.CollectionId,
         coll: []const u8,
         field: []const u8,
         value: doc_mod.Value,
     ) !?u64 {
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(collection_id) };
         return self.findOneInView(view, coll, field, value);
     }
 
@@ -509,11 +535,12 @@ pub const Manager = struct {
         self: *const Manager,
         allocator: Allocator,
         pager: *pager_mod.Pager,
+        collection_id: pager_mod.CollectionId,
         coll: []const u8,
         field: []const u8,
         value: doc_mod.Value,
     ) !LookupIterator {
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(collection_id) };
         return self.findAllInView(allocator, view, coll, field, value);
     }
 
@@ -553,12 +580,13 @@ pub const Manager = struct {
         self: *const Manager,
         allocator: Allocator,
         pager: *pager_mod.Pager,
+        collection_id: pager_mod.CollectionId,
         coll: []const u8,
         field: []const u8,
         lo: Bound,
         hi: Bound,
     ) !RangeIterator {
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(collection_id) };
         return self.findRangeInView(allocator, view, coll, field, lo, hi);
     }
 
