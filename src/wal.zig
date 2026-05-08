@@ -278,8 +278,18 @@ pub const Wal = struct {
     /// Push the staged records to disk in a single `pwritev`. Does not
     /// fsync — call `sync()` for that. Cheap to call when the buffer is
     /// empty (no-op).
+    ///
+    /// Sharding phase 3: refreshes `end_offset` from shm before
+    /// pwriting. Caller must hold the WAL append lock (byte 8) so the
+    /// load → pwrite → store sequence is atomic across processes; with
+    /// per-collection writer locks, two parallel committers can both
+    /// reach this point with stale local `end_offset` values, and
+    /// without the refresh they'd pwrite at the same offset and
+    /// corrupt the WAL.
     pub fn flush(self: *Wal) !void {
         if (self.pending.items.len == 0) return;
+        const live_end = self.shm_end_offset.load(.acquire);
+        if (live_end > self.end_offset) self.end_offset = live_end;
         try self.file.writePositionalAll(self.io, self.pending.items, self.end_offset);
         self.end_offset += self.pending.items.len;
         self.shm_end_offset.store(self.end_offset, .release);

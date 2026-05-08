@@ -264,9 +264,19 @@ pub const Db = struct {
     // until commit/abort releases it; auto-commit ops on the same thread
     // re-enter without relocking.
     pub fn begin(self: *Db) !void {
+        return self.beginForCollection(pager_mod.default_collection_id);
+    }
+
+    /// Internal: open an explicit txn rooted at a specific collection
+    /// (sharding phase 3). Used by `OptimisticTxn.commit` so OCC's
+    /// validate-and-apply runs under the right per-collection writer
+    /// lock — without this, an OCC txn that wrote to a non-default
+    /// collection would publish its new root to no one (the lock
+    /// holder's slot only).
+    pub fn beginForCollection(self: *Db, cid: pager_mod.CollectionId) !void {
         self.mu.lockUncancelable(self.pager.io);
         errdefer self.mu.unlock(self.pager.io);
-        try self.pager.begin();
+        try self.pager.begin(cid);
         self.txn_owner.store(std.Thread.getCurrentId(), .release);
     }
     pub fn commit(self: *Db) !void {
@@ -417,7 +427,7 @@ pub const Db = struct {
         const id = blk: {
             self.mu.lockUncancelable(self.pager.io);
             defer self.mu.unlock(self.pager.io);
-            try self.pager.begin();
+            try self.pager.begin(pager_mod.default_collection_id);
             errdefer self.pager.abort();
 
             // Find the lowest unused slot starting at 1 (slot 0 reserved for default).
@@ -541,7 +551,7 @@ pub const Db = struct {
         const commit_lsn = blk: {
             self.mu.lockUncancelable(self.pager.io);
             defer self.mu.unlock(self.pager.io);
-            try self.pager.begin();
+            try self.pager.begin(cid);
             errdefer self.pager.abort();
             try self.indexes.createIndex(&self.pager, cid, coll, field_path);
             const lsn = try self.pager.commitAppend();
@@ -561,7 +571,7 @@ pub const Db = struct {
         const commit_lsn = blk: {
             self.mu.lockUncancelable(self.pager.io);
             defer self.mu.unlock(self.pager.io);
-            try self.pager.begin();
+            try self.pager.begin(cid);
             errdefer self.pager.abort();
             try self.indexes.dropIndex(&self.pager, cid, coll, field_path);
             const lsn = try self.pager.commitAppend();
@@ -584,7 +594,7 @@ pub const Db = struct {
         const commit_lsn = blk: {
             self.mu.lockUncancelable(self.pager.io);
             defer self.mu.unlock(self.pager.io);
-            try self.pager.begin();
+            try self.pager.begin(cid);
             errdefer self.pager.abort();
             try self.indexes.createCompoundIndex(&self.pager, cid, coll, fields);
             const lsn = try self.pager.commitAppend();
@@ -604,7 +614,7 @@ pub const Db = struct {
         const commit_lsn = blk: {
             self.mu.lockUncancelable(self.pager.io);
             defer self.mu.unlock(self.pager.io);
-            try self.pager.begin();
+            try self.pager.begin(cid);
             errdefer self.pager.abort();
             try self.indexes.dropCompoundIndex(&self.pager, cid, coll, fields);
             const lsn = try self.pager.commitAppend();
@@ -631,7 +641,7 @@ pub const Collection = struct {
         const id = blk: {
             self.db.mu.lockUncancelable(self.db.pager.io);
             defer self.db.mu.unlock(self.db.pager.io);
-            try self.db.pager.begin();
+            try self.db.pager.begin(self.id);
             errdefer self.db.pager.abort();
             const inserted_id = try self.insertLocked(doc_bytes);
             commit_lsn = try self.db.pager.commitAppend();
@@ -657,7 +667,7 @@ pub const Collection = struct {
         const commit_lsn = blk: {
             self.db.mu.lockUncancelable(self.db.pager.io);
             defer self.db.mu.unlock(self.db.pager.io);
-            try self.db.pager.begin();
+            try self.db.pager.begin(self.id);
             errdefer self.db.pager.abort();
             try self.putLocked(doc_id, doc_bytes);
             const lsn = try self.db.pager.commitAppend();
@@ -699,7 +709,7 @@ pub const Collection = struct {
         const found = blk: {
             self.db.mu.lockUncancelable(self.db.pager.io);
             defer self.db.mu.unlock(self.db.pager.io);
-            try self.db.pager.begin();
+            try self.db.pager.begin(self.id);
             errdefer self.db.pager.abort();
             const f = try self.deleteLocked(doc_id);
             commit_lsn = try self.db.pager.commitAppend();
@@ -1175,22 +1185,44 @@ pub const OptimisticTxn = struct {
     /// Validate the read set against the live tree, then apply the
     /// write set under db.mu. Returns `error.WriteConflict` if any
     /// observed value has changed since this txn began.
+    ///
+    /// Sharding phase 3: the validate-and-apply phase runs under the
+    /// writer lock for the collection the txn modified (so its new
+    /// root gets published from `applyAndFinalize`). If the txn
+    /// touched multiple collections, we fall back to the default
+    /// collection's lock — phase 3 doesn't yet support cross-collection
+    /// OCC. (Validation still consults the right snapshot per-id since
+    /// reads route through `db.collection(name)` / the catalog cache.)
     pub fn commit(self: *OptimisticTxn) !void {
         defer self.deinitAll();
+        const cid = self.commitCollectionId();
 
-        // Open a pessimistic txn for the validate+apply phase. Auto-
-        // commit ops on this thread re-enter through ownsTxn() and
-        // share the lock without relocking.
-        try self.db.begin();
+        // Open a pessimistic txn rooted at `cid`. Auto-commit ops on
+        // this thread re-enter through ownsTxn() and share the lock
+        // without relocking.
+        try self.db.beginForCollection(cid);
 
         self.validateAndApply() catch |err| {
             self.db.abort();
             return err;
         };
 
-        // Db.commit reliably releases db.mu whether it returns ok or
-        // an error, so we do not call abort on its failure path.
         try self.db.commit();
+    }
+
+    /// Pick the collection id whose writer lock the validate-and-apply
+    /// phase should hold. If every write_set entry agrees on a single
+    /// collection, that's the answer; otherwise we fall back to the
+    /// default tree (the catalog's home). Phase 3 will WriteConflict-
+    /// or-not based purely on read-set checks for that fallback case.
+    fn commitCollectionId(self: *OptimisticTxn) pager_mod.CollectionId {
+        if (self.write_set.items.len == 0) return pager_mod.default_collection_id;
+        const first = self.db.collections.get(self.write_set.items[0].coll) orelse pager_mod.default_collection_id;
+        for (self.write_set.items[1..]) |w| {
+            const cid = self.db.collections.get(w.coll) orelse pager_mod.default_collection_id;
+            if (cid != first) return pager_mod.default_collection_id;
+        }
+        return first;
     }
 
     fn validateAndApply(self: *OptimisticTxn) !void {

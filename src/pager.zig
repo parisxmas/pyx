@@ -39,8 +39,24 @@ const flock_mod = @import("flock.zig");
 // Byte regions for cross-process advisory locks. SQLite uses a similar
 // byte-array pattern; the bytes themselves don't need real data — they
 // just serve as namespaces for fcntl record locks.
+//
+// Sharding phase 3 lock layout:
+//   byte  0       : open serializer + checkpoint (stop-the-world)
+//   byte  2       : reserved for legacy/future use
+//   byte  8       : WAL append serializer (held briefly during wal.flush)
+//   bytes 16+i    : per-collection commit lock (held during begin → finalize)
+//
+// COMPAT NOTE: v0.4.0 used byte 0 for both the open path AND the entire
+// commit pipeline. v0.5.0 moves commits to bytes 16+i. Mixing v0.4.0 and
+// v0.5.0 processes on the same DB is unsafe — they would not block each
+// other on commit.
 const writer_lock_region: flock_mod.Region = .{ .start = 0, .len = 1 };
 const recovery_lock_region: flock_mod.Region = .{ .start = 2, .len = 1 };
+const wal_append_lock_region: flock_mod.Region = .{ .start = 8, .len = 1 };
+
+fn collectionWriterLockRegion(id: CollectionId) flock_mod.Region {
+    return .{ .start = 16 + @as(u64, id), .len = 1 };
+}
 
 pub const page_size: u32 = 4096;
 pub const PageId = u32;
@@ -192,6 +208,10 @@ pub const Pager = struct {
     header_dirty: bool,
     in_txn: bool,
     in_recovery: bool,
+    /// Which collection's writer lock is held by the in-flight txn
+    /// (sharding phase 3). Set by `begin(collection_id)`, cleared by
+    /// `applyAndFinalize` / `abort` after the matching unlock.
+    txn_collection_id: ?CollectionId,
     txn_header_snapshot: Header,
     /// Per-txn buffer; cleared on commit (pages moved to `page_cache`) or
     /// on abort (pages destroyed).
@@ -319,6 +339,7 @@ pub const Pager = struct {
             .header_dirty = false,
             .in_txn = false,
             .in_recovery = false,
+            .txn_collection_id = null,
             .txn_header_snapshot = header,
             .dirty = .empty,
             .page_cache = .empty,
@@ -396,8 +417,12 @@ pub const Pager = struct {
     /// This is the only path that writes the on-disk DB file; commits leave
     /// modifications in `page_cache` for batched application here.
     ///
-    /// Takes the cross-process WRITER fcntl lock so it can't race a
-    /// concurrent committer's WAL append. Skipped during recovery.
+    /// Sharding phase 3: takes the OPEN lock (byte 0, serialises with
+    /// concurrent opens) AND the WAL APPEND lock (byte 8, blocks
+    /// concurrent committers at their wal.flush step). Together these
+    /// give checkpoint a stop-the-world window for the WAL truncation
+    /// without having to grab every per-collection writer byte.
+    /// Skipped during recovery (we already hold byte 0 from open-time).
     pub fn checkpoint(self: *Pager) !void {
         if (self.in_txn) return Error.TxnAlreadyActive;
         if (!self.in_recovery) {
@@ -405,6 +430,12 @@ pub const Pager = struct {
         }
         defer if (!self.in_recovery) {
             flock_mod.unlock(self.file.handle, writer_lock_region) catch {};
+        };
+        if (!self.in_recovery) {
+            try flock_mod.lock(self.file.handle, .write, wal_append_lock_region);
+        }
+        defer if (!self.in_recovery) {
+            flock_mod.unlock(self.file.handle, wal_append_lock_region) catch {};
         };
 
         // Apply non-header pages first; header page 0 last, so a crash
@@ -438,31 +469,41 @@ pub const Pager = struct {
         self.header_dirty = false;
     }
 
-    pub fn begin(self: *Pager) !void {
+    pub fn begin(self: *Pager, collection_id: CollectionId) !void {
         if (self.in_txn) return Error.TxnAlreadyActive;
-        // Cross-process WRITER lock — held for the entire txn so only
-        // one process is mutating the DB at a time. In-process callers
-        // are already serialised by `db.mu`; this is the
-        // cross-process equivalent. Skipped during recovery (we hold
-        // the lock from open-time and don't want to block replay).
+        std.debug.assert(collection_id < max_collections);
+        // Per-collection WRITER lock (sharding phase 3) — only commits
+        // to the SAME collection serialise. Writers to different
+        // collections can be in begin → applyAndFinalize concurrently
+        // because their dirty pages don't overlap (different B+Tree
+        // roots) and their root updates target different shm slots.
+        // In-process callers are still serialised by `db.mu`; this is
+        // the cross-process equivalent. Skipped during recovery (we
+        // hold byte 0 from open-time and don't want to block replay).
         if (!self.in_recovery) {
-            try flock_mod.lock(self.file.handle, .write, writer_lock_region);
+            try flock_mod.lock(self.file.handle, .write, collectionWriterLockRegion(collection_id));
         }
         errdefer if (!self.in_recovery) {
-            flock_mod.unlock(self.file.handle, writer_lock_region) catch {};
+            flock_mod.unlock(self.file.handle, collectionWriterLockRegion(collection_id)) catch {};
         };
+        self.txn_collection_id = collection_id;
 
-        // Now that we hold the WRITER lock, refresh our in-process
-        // header from shm. Another process may have committed while
-        // we were waiting; we must build on top of THEIR root, not
-        // our (stale) cached one. shm is the cross-process source of
-        // truth for the live counters; the in-process header is just
-        // a working copy.
+        // Now that we hold this collection's writer lock, refresh
+        // shm-resident state. The atomics aren't gated by our lock
+        // (other processes' writers may be advancing them in parallel),
+        // but that's fine: we only NEED a coherent snapshot of OUR
+        // collection's root and the global counters. .acquire orders
+        // every load against any writer's .release at applyAndFinalize.
         self.header.btree_root = @intCast(self.shm.btreeRoot().load(.acquire));
         self.header.num_pages = self.shm.numPages().load(.acquire);
         self.header.next_doc_id = self.shm.nextDocId().load(.acquire);
-        self.header.free_head = @intCast(self.shm.freeHead().load(.acquire));
-        // Per-collection roots also flow through shm (sharding phase 2B).
+        // Free-list head only matters when committing to the default
+        // collection (only that path uses page reuse in phase 3 — see
+        // allocPageInner).
+        if (collection_id == default_collection_id) {
+            self.header.free_head = @intCast(self.shm.freeHead().load(.acquire));
+        }
+        // Per-collection roots flow through shm (sharding phase 2B).
         var slot: usize = 0;
         while (slot < max_collections) : (slot += 1) {
             self.header.collection_roots[slot] = @intCast(self.shm.collectionRoot(slot).load(.acquire));
@@ -550,9 +591,19 @@ pub const Pager = struct {
         }
         const commit_lsn = lsn_counter.fetchAdd(1, .monotonic);
         try self.wal.appendCommit(commit_lsn, self.header.next_doc_id);
-        // One pwritev for the whole batch (PUTs + COMMIT). Records reach
-        // the kernel page cache here; durability is the next phase's job.
-        try self.wal.flush();
+        // WAL append serialiser (sharding phase 3). Wal.flush refreshes
+        // its end_offset from shm under this lock, then pwrites at
+        // that offset. Without this lock, two parallel committers (in
+        // different collections) would both pwrite at the same
+        // end_offset and corrupt each other's records.
+        try flock_mod.lock(self.file.handle, .write, wal_append_lock_region);
+        {
+            defer flock_mod.unlock(self.file.handle, wal_append_lock_region) catch {};
+            // One pwritev for the whole batch (PUTs + COMMIT). Records
+            // reach the kernel page cache here; durability is the
+            // next phase's job.
+            try self.wal.flush();
+        }
         // Publish the new high-water mark to the fsync queue. Any leader
         // that takes its snapshot after this `store` is guaranteed to
         // see (and fsync) our records.
@@ -604,20 +655,17 @@ pub const Pager = struct {
             self.allocator.destroy(hbuf);
         }
         self.dirty.clearRetainingCapacity();
-        // Publish the new root + free-list head. Any reader on
-        // another process that sees these values can dereference
-        // them against the file safely.
-        self.shm.freeHead().store(@intCast(self.header.free_head), .release);
-        self.shm.btreeRoot().store(@intCast(self.header.btree_root), .release);
-        // Sharding phase 2B: publish per-collection roots. Slots that
-        // weren't touched still hold their previous value — writing
-        // the same value back is harmless. Order: shm.btreeRoot then
-        // collectionRoot[0] keep matching values; in this same write
-        // wave the kernel page cache also reflects every dirty page
-        // we just pwrote.
-        var slot: usize = 0;
-        while (slot < max_collections) : (slot += 1) {
-            self.shm.collectionRoot(slot).store(@intCast(self.header.collection_roots[slot]), .release);
+        // Publish only THIS collection's root (sharding phase 3) — other
+        // slots are owned by other writers' commits running in parallel
+        // and we'd clobber their progress if we wrote them all back.
+        // The default tree's free-list head is also only published when
+        // committing to the default collection (only that path mutates
+        // it; non-default collections always extend the file).
+        const cid = self.txn_collection_id orelse default_collection_id;
+        self.shm.collectionRoot(cid).store(@intCast(self.header.collection_roots[cid]), .release);
+        if (cid == default_collection_id) {
+            self.shm.btreeRoot().store(@intCast(self.header.btree_root), .release);
+            self.shm.freeHead().store(@intCast(self.header.free_head), .release);
         }
 
         self.pending.clearRetainingCapacity();
@@ -625,26 +673,30 @@ pub const Pager = struct {
         self.txn_append_hint = null;
         self.header_dirty = false;
         self.in_txn = false;
+        self.txn_collection_id = null;
         if (!self.in_recovery) {
-            flock_mod.unlock(self.file.handle, writer_lock_region) catch {};
+            flock_mod.unlock(self.file.handle, collectionWriterLockRegion(cid)) catch {};
         }
     }
 
     pub fn abort(self: *Pager) void {
         if (!self.in_txn) return;
+        const cid = self.txn_collection_id orelse default_collection_id;
         self.clearDirty();
         self.pending.clearRetainingCapacity();
         _ = self.txn_arena.reset(.retain_capacity);
         self.txn_append_hint = null;
         self.header = self.txn_header_snapshot;
         // Roll the live page counter back so aborted txns don't leak
-        // page ids — matches pre-shm behaviour. Safe under the WRITER
-        // fcntl lock: only this process is in the critical section.
+        // page ids. Safe under our per-collection writer lock: any
+        // concurrent writer would be in a different collection and
+        // wouldn't bump shm.numPages on our slice's behalf.
         self.shm.numPages().store(self.txn_header_snapshot.num_pages, .release);
         self.header_dirty = false;
         self.in_txn = false;
+        self.txn_collection_id = null;
         if (!self.in_recovery) {
-            flock_mod.unlock(self.file.handle, writer_lock_region) catch {};
+            flock_mod.unlock(self.file.handle, collectionWriterLockRegion(cid)) catch {};
         }
     }
 
@@ -727,7 +779,7 @@ pub const Pager = struct {
 
     pub fn allocPage(self: *Pager) !PageId {
         if (self.in_txn) return self.allocPageInner();
-        try self.begin();
+        try self.begin(default_collection_id);
         errdefer self.abort();
         const id = try self.allocPageInner();
         try self.commit();
@@ -735,7 +787,14 @@ pub const Pager = struct {
     }
 
     fn allocPageInner(self: *Pager) !PageId {
-        if (self.header.free_head != 0) {
+        // Sharding phase 3: free-list reuse is only safe for the default
+        // tree, where the byte-16+0 writer lock guarantees a single
+        // committer at a time. Non-default-tree writers run in parallel
+        // and would race on `header.free_head` / `shm.freeHead`, so they
+        // always extend the file via fetchAdd. Cost: pages freed by
+        // non-default deletes leak (data file grows). Phase 4 fix.
+        const cid = self.txn_collection_id orelse default_collection_id;
+        if (cid == default_collection_id and self.header.free_head != 0) {
             const id = self.header.free_head;
             var page: [page_size]u8 = undefined;
             try self.readPageInternal(id, &page);
@@ -743,10 +802,10 @@ pub const Pager = struct {
             self.header_dirty = true;
             return id;
         }
-        // Atomic-counter allocation so concurrent processes (under the
-        // phase-1C WRITER lock) hand out unique page ids. The on-disk
-        // header is brought up to the live count at the start of every
-        // `commitAppend` — same pattern as `next_doc_id`.
+        // Atomic-counter allocation so concurrent processes hand out
+        // unique page ids. shm.numPages is the cross-process source of
+        // truth; the on-disk header is brought up to the live count at
+        // the start of every `commitAppend`.
         const id: PageId = @intCast(self.shm.numPages().fetchAdd(1, .monotonic));
         self.header_dirty = true;
         const zero: [page_size]u8 = @splat(0);
@@ -756,7 +815,7 @@ pub const Pager = struct {
 
     pub fn freePage(self: *Pager, id: PageId) !void {
         if (self.in_txn) return self.freePageInner(id);
-        try self.begin();
+        try self.begin(default_collection_id);
         errdefer self.abort();
         try self.freePageInner(id);
         try self.commit();
@@ -765,6 +824,13 @@ pub const Pager = struct {
     fn freePageInner(self: *Pager, id: PageId) !void {
         if (id == 0) return Error.CannotFreeHeader;
         if (id >= self.shm.numPages().load(.monotonic)) return Error.InvalidPageId;
+        // Sharding phase 3: only the default tree's free list is
+        // maintained (see `allocPageInner` for why). Non-default-tree
+        // freePage is a no-op — the page leaks. Acceptable for phase 3;
+        // phase 4 will add per-collection free-list machinery with
+        // proper cross-process semantics.
+        const cid = self.txn_collection_id orelse default_collection_id;
+        if (cid != default_collection_id) return;
         var page: [page_size]u8 = @splat(0);
         mem.writeInt(u32, page[0..4], self.header.free_head, .little);
         try self.writePageInternal(id, &page);
@@ -783,7 +849,7 @@ pub const Pager = struct {
             try self.writePageInternal(id, buf);
             return;
         }
-        try self.begin();
+        try self.begin(default_collection_id);
         errdefer self.abort();
         try self.writePageInternal(id, buf);
         try self.commit();
@@ -797,7 +863,7 @@ pub const Pager = struct {
             // writes when the same txn allocates many ids.
             return id;
         }
-        try self.begin();
+        try self.begin(default_collection_id);
         errdefer self.abort();
         try self.commit();
         return id;
@@ -845,7 +911,7 @@ pub const Pager = struct {
             self.header_dirty = true;
             return;
         }
-        try self.begin();
+        try self.begin(default_collection_id);
         errdefer self.abort();
         self.header.collection_roots[collection_id] = new_root;
         if (collection_id == default_collection_id) self.header.btree_root = new_root;
@@ -968,7 +1034,7 @@ test "explicit txn commit applies all writes atomically" {
     var p = try Pager.open(testing.allocator, testing.io, tmp.dir, "tx.db");
     defer p.close();
 
-    try p.begin();
+    try p.begin(default_collection_id);
     const a = try p.allocPage();
     const b = try p.allocPage();
     const img_a: [page_size]u8 = @splat(0x11);
@@ -997,7 +1063,7 @@ test "abort restores pre-txn state" {
     try p.write(id, &original);
     const num_pages_before = p.header.num_pages;
 
-    try p.begin();
+    try p.begin(default_collection_id);
     const tentative: [page_size]u8 = @splat(0x99);
     try p.write(id, &tentative);
     _ = try p.allocPage();

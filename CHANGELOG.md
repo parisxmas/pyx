@@ -7,6 +7,46 @@ tag goes under `## Unreleased`.
 
 ## Unreleased
 
+### Added
+- Keyspace sharding, phase 3: **per-collection writer locks**.
+  Two processes (or two `Db` handles) committing to *different*
+  collections no longer block each other on the cross-process
+  WRITER fcntl. New byte-region layout:
+    - byte  0    : open serializer + checkpoint (stop-the-world)
+    - byte  8    : WAL append serializer (held briefly during
+                   `wal.flush`, refreshes `end_offset` from shm under
+                   the lock so two parallel committers can't pwrite
+                   at the same offset)
+    - bytes 16+i : per-collection commit lock (held during
+                   `begin → applyAndFinalize`)
+  `Pager.begin(collection_id)` takes the per-collection byte;
+  `applyAndFinalize` releases it and publishes ONLY that
+  collection's slot in shm (writing all slots back, as phase 2B
+  did, would clobber a parallel writer's progress).
+  `Pager.checkpoint` stops the world via byte 0 + byte 8.
+  `Db.beginForCollection(cid)` exposes the per-collection variant
+  to OCC; `OptimisticTxn.commit` picks the writer lock based on
+  the collection it modified (single-collection only — cross-
+  collection OCC stays a phase 4 limitation).
+
+  Sharding phase 3 also disables free-list reuse for non-default
+  collections — `allocPageInner` always extends the file via
+  `shm.numPages.fetchAdd` for those, and `freePageInner` is a no-op.
+  Reason: the existing free-list machinery uses per-process
+  `header.free_head` which would race under parallel commits.
+  Default-tree behaviour is unchanged (single-writer-at-a-time
+  on byte 16+0, free list reused as before). Trade-off:
+  non-default collections leak pages on delete; data file grows.
+  Phase 4 will add cross-process-safe per-collection free lists.
+
+  COMPAT NOTE: v0.4.0 used byte 0 for the entire commit pipeline.
+  v0.5.0 commits to bytes 16+i. **Mixing v0.4.0 and v0.5.0
+  processes on the same DB is unsafe** — they would not block
+  each other on commit. Upgrade everything together.
+
+  Tests: 97/97 still pass. Phase-3-specific multi-process
+  benchmark coming alongside the release in `bench/`.
+
 ### Fixed
 - Sharding: indexes on created collections actually work now. The
   0.4.0 limitation was that `createIndex` / `createCompoundIndex`

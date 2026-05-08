@@ -579,7 +579,7 @@ pub const BTree = struct {
             try self.pager.recordPut(self.collection_id, key, value);
             return self.putTxn(key, value);
         }
-        try self.pager.begin();
+        try self.pager.begin(self.collection_id);
         errdefer self.pager.abort();
         try self.pager.recordPut(self.collection_id, key, value);
         try self.putTxn(key, value);
@@ -979,7 +979,7 @@ pub const BTree = struct {
             try self.pager.recordDelete(self.collection_id, key);
             return self.deleteTxn(key);
         }
-        try self.pager.begin();
+        try self.pager.begin(self.collection_id);
         errdefer self.pager.abort();
         try self.pager.recordDelete(self.collection_id, key);
         const found = try self.deleteTxn(key);
