@@ -1,0 +1,418 @@
+"""pyx — embeddable document database. Python binding.
+
+    >>> import pyx
+    >>> with pyx.Db.open("mydb.pyx") as db:
+    ...     users = db.collection("users")
+    ...     uid = users.insert({"name": "Alice", "age": 30})
+    ...     print(users.get(uid))
+    {'name': 'Alice', 'age': 30}
+
+The library binary is loaded from one of (in order): the `PYX_LIBRARY` env
+var, the package directory (post-install), the project's `zig-out/lib`
+directory (development checkout). Build with `zig build` first.
+"""
+from __future__ import annotations
+
+import ctypes as C
+from contextlib import contextmanager
+from typing import Iterator, Optional, Union
+
+from . import _doc, _ffi
+from .errors import PyxError, from_status
+
+__all__ = [
+    "Db",
+    "Collection",
+    "Snapshot",
+    "PyxError",
+    "version",
+    "format_version",
+]
+
+ScalarValue = Union[None, bool, int, float, str]
+
+
+def version() -> str:
+    return _ffi.pyx_version_string().decode("utf-8")
+
+
+def format_version() -> int:
+    return int(_ffi.pyx_format_version())
+
+
+def _check(rc: int) -> None:
+    if rc < 0:
+        msg = _ffi.pyx_last_error().decode("utf-8", errors="replace")
+        raise from_status(rc, msg)
+
+
+def _utf8(s: str) -> bytes:
+    return s.encode("utf-8")
+
+
+def _to_pyx_value(v: ScalarValue, pins: list) -> _ffi.PyxValue:
+    """Convert a Python scalar to a `pyx_value`. `pins` keeps any bytes
+    objects (for strings) alive across the C call — append everything you
+    need to outlive the call to it."""
+    val = _ffi.PyxValue()
+    if v is None:
+        val.type = _ffi.PYX_VAL_NULL
+    elif isinstance(v, bool):
+        val.type = _ffi.PYX_VAL_BOOL
+        val.as_.boolean = 1 if v else 0
+    elif isinstance(v, int):
+        val.type = _ffi.PYX_VAL_I64
+        val.as_.i64_v = v
+    elif isinstance(v, float):
+        val.type = _ffi.PYX_VAL_F64
+        val.as_.f64_v = v
+    elif isinstance(v, str):
+        b = v.encode("utf-8")
+        c_buf = (C.c_uint8 * len(b)).from_buffer_copy(b)
+        pins.append(c_buf)
+        val.type = _ffi.PYX_VAL_STRING
+        val.as_.string.ptr = C.cast(c_buf, C.POINTER(C.c_uint8))
+        val.as_.string.len = len(b)
+    else:
+        raise TypeError(f"unsupported indexed value type: {type(v).__name__}")
+    return val
+
+
+def _to_bound(v: Optional["Bound"], pins: list) -> Optional[_ffi.PyxBound]:
+    """Convert None/Bound into a pyx_bound. None → no bound."""
+    if v is None:
+        return None
+    if isinstance(v, Bound):
+        b = _ffi.PyxBound()
+        b.kind = v._kind
+        if v._value is not None:
+            b.value = _to_pyx_value(v._value, pins)
+        return b
+    raise TypeError("range bound must be a Bound instance or None")
+
+
+class Bound:
+    """Lower or upper bound for `find_range`.
+
+    Use `Bound.inclusive(value)` or `Bound.exclusive(value)`. Pass None
+    (or omit) for an unbounded side.
+    """
+
+    __slots__ = ("_kind", "_value")
+
+    def __init__(self, kind: int, value: Optional[ScalarValue]):
+        self._kind = kind
+        self._value = value
+
+    @classmethod
+    def inclusive(cls, value: ScalarValue) -> "Bound":
+        return cls(_ffi.PYX_BOUND_INCLUSIVE, value)
+
+    @classmethod
+    def exclusive(cls, value: ScalarValue) -> "Bound":
+        return cls(_ffi.PYX_BOUND_EXCLUSIVE, value)
+
+
+# ---------------------------------------------------------------------
+# Db
+# ---------------------------------------------------------------------
+
+class Db:
+    """A pyx database. Create with `Db.open(path)` (recommended via `with`)."""
+
+    __slots__ = ("_handle",)
+
+    def __init__(self, handle):
+        self._handle = handle
+
+    @classmethod
+    def open(cls, path: str) -> "Db":
+        out = C.c_void_p()
+        rc = _ffi.pyx_open(path.encode("utf-8"), C.byref(out))
+        _check(rc)
+        return cls(out)
+
+    def close(self) -> None:
+        if self._handle:
+            _ffi.pyx_close(self._handle)
+            self._handle = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __del__(self):
+        self.close()
+
+    def set_sync_mode(self, normal: bool = True) -> None:
+        _ffi.pyx_set_sync_mode(self._handle, _ffi.PYX_SYNC_NORMAL if normal else _ffi.PYX_SYNC_FULL)
+
+    def checkpoint(self) -> None:
+        _check(_ffi.pyx_checkpoint(self._handle))
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        _check(_ffi.pyx_begin(self._handle))
+        try:
+            yield
+        except Exception:
+            _ffi.pyx_abort(self._handle)
+            raise
+        else:
+            _check(_ffi.pyx_commit(self._handle))
+
+    def collection(self, name: str) -> "Collection":
+        return Collection(self, name)
+
+    def snapshot(self) -> "Snapshot":
+        out = C.c_void_p()
+        _check(_ffi.pyx_snapshot_open(self._handle, C.byref(out)))
+        return Snapshot(self, out)
+
+    def create_index(self, collection: str, field: str) -> None:
+        cb, fb = _utf8(collection), _utf8(field)
+        _check(_ffi.pyx_create_index(self._handle, cb, len(cb), fb, len(fb)))
+
+    def drop_index(self, collection: str, field: str) -> None:
+        cb, fb = _utf8(collection), _utf8(field)
+        _check(_ffi.pyx_drop_index(self._handle, cb, len(cb), fb, len(fb)))
+
+
+# ---------------------------------------------------------------------
+# Collection
+# ---------------------------------------------------------------------
+
+def _doc_to_bytes(doc: dict) -> tuple[bytes, int]:
+    b = _doc.encode(doc)
+    arr = (C.c_uint8 * len(b)).from_buffer_copy(b)
+    return arr, len(b)
+
+
+def _read_buf(buf: _ffi.PyxBuf) -> dict:
+    n = int(buf.len)
+    if n == 0 or not buf.data:
+        return {}
+    raw = bytes(buf.data[:n])
+    _ffi.pyx_buf_free(C.byref(buf))
+    return _doc.decode(raw)
+
+
+class Collection:
+    __slots__ = ("_db", "_name", "_name_bytes")
+
+    def __init__(self, db: Db, name: str):
+        self._db = db
+        self._name = name
+        self._name_bytes = name.encode("utf-8")
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def insert(self, doc: dict) -> int:
+        arr, n = _doc_to_bytes(doc)
+        out = C.c_uint64()
+        _check(_ffi.pyx_insert(
+            self._db._handle, self._name_bytes, len(self._name_bytes),
+            arr, n, C.byref(out),
+        ))
+        return int(out.value)
+
+    def put(self, doc_id: int, doc: dict) -> None:
+        arr, n = _doc_to_bytes(doc)
+        _check(_ffi.pyx_put(
+            self._db._handle, self._name_bytes, len(self._name_bytes),
+            doc_id, arr, n,
+        ))
+
+    def get(self, doc_id: int) -> Optional[dict]:
+        buf = _ffi.PyxBuf()
+        rc = _ffi.pyx_get(
+            self._db._handle, self._name_bytes, len(self._name_bytes),
+            doc_id, C.byref(buf),
+        )
+        if rc == _ffi.PYX_NOT_FOUND:
+            return None
+        _check(rc)
+        return _read_buf(buf)
+
+    def delete(self, doc_id: int) -> bool:
+        rc = _ffi.pyx_delete(
+            self._db._handle, self._name_bytes, len(self._name_bytes), doc_id,
+        )
+        if rc == _ffi.PYX_NOT_FOUND:
+            return False
+        _check(rc)
+        return True
+
+    def __iter__(self) -> Iterator[tuple[int, dict]]:
+        return self._iter(snapshot_handle=None)
+
+    def _iter(self, snapshot_handle) -> Iterator[tuple[int, dict]]:
+        h = C.c_void_p()
+        if snapshot_handle is None:
+            _check(_ffi.pyx_iter_open(
+                self._db._handle, self._name_bytes, len(self._name_bytes),
+                C.byref(h),
+            ))
+        else:
+            _check(_ffi.pyx_snapshot_iter_open(
+                snapshot_handle, self._name_bytes, len(self._name_bytes),
+                C.byref(h),
+            ))
+        try:
+            while True:
+                doc_id = C.c_uint64()
+                buf = _ffi.PyxBuf()
+                rc = _ffi.pyx_iter_next(h, C.byref(doc_id), C.byref(buf))
+                if rc == _ffi.PYX_END:
+                    return
+                _check(rc)
+                # buf borrows iterator-internal memory, valid until next call.
+                # Decode to a dict (which copies) before yielding.
+                if buf.len > 0 and buf.data:
+                    raw = bytes(buf.data[: int(buf.len)])
+                    yield int(doc_id.value), _doc.decode(raw)
+        finally:
+            _ffi.pyx_iter_close(h)
+
+    def find_one(self, field: str, value: ScalarValue) -> Optional[int]:
+        pins: list = []
+        v = _to_pyx_value(value, pins)
+        out = C.c_uint64()
+        cb = _utf8(field)
+        rc = _ffi.pyx_find_one(
+            self._db._handle, self._name_bytes, len(self._name_bytes),
+            cb, len(cb), C.byref(v), C.byref(out),
+        )
+        del pins
+        if rc == _ffi.PYX_NOT_FOUND:
+            return None
+        _check(rc)
+        return int(out.value)
+
+    def find_range(
+        self,
+        field: str,
+        lo: Optional[Bound] = None,
+        hi: Optional[Bound] = None,
+    ) -> Iterator[int]:
+        return self._range(field, lo, hi, snapshot_handle=None)
+
+    def _range(
+        self,
+        field: str,
+        lo: Optional[Bound],
+        hi: Optional[Bound],
+        snapshot_handle,
+    ) -> Iterator[int]:
+        cb = _utf8(field)
+        pins: list = []
+        lo_b = _to_bound(lo, pins)
+        hi_b = _to_bound(hi, pins)
+        h = C.c_void_p()
+        if snapshot_handle is None:
+            _check(_ffi.pyx_find_range(
+                self._db._handle, self._name_bytes, len(self._name_bytes),
+                cb, len(cb),
+                C.byref(lo_b) if lo_b else None,
+                C.byref(hi_b) if hi_b else None,
+                C.byref(h),
+            ))
+        else:
+            _check(_ffi.pyx_snapshot_find_range(
+                snapshot_handle, self._name_bytes, len(self._name_bytes),
+                cb, len(cb),
+                C.byref(lo_b) if lo_b else None,
+                C.byref(hi_b) if hi_b else None,
+                C.byref(h),
+            ))
+        try:
+            while True:
+                out = C.c_uint64()
+                rc = _ffi.pyx_lookup_next(h, C.byref(out))
+                if rc == _ffi.PYX_END:
+                    return
+                _check(rc)
+                yield int(out.value)
+        finally:
+            _ffi.pyx_lookup_close(h)
+
+
+# ---------------------------------------------------------------------
+# Snapshot — lock-free reads
+# ---------------------------------------------------------------------
+
+class Snapshot:
+    """A point-in-time read-only view. Lock-free; safe to share across threads."""
+
+    __slots__ = ("_db", "_handle")
+
+    def __init__(self, db: Db, handle):
+        self._db = db
+        self._handle = handle
+
+    def close(self) -> None:
+        if self._handle:
+            _ffi.pyx_snapshot_close(self._handle)
+            self._handle = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __del__(self):
+        self.close()
+
+    def collection(self, name: str) -> "SnapshotCollection":
+        return SnapshotCollection(self, name)
+
+
+class SnapshotCollection:
+    __slots__ = ("_snap", "_name", "_name_bytes")
+
+    def __init__(self, snap: Snapshot, name: str):
+        self._snap = snap
+        self._name = name
+        self._name_bytes = name.encode("utf-8")
+
+    def get(self, doc_id: int) -> Optional[dict]:
+        buf = _ffi.PyxBuf()
+        rc = _ffi.pyx_snapshot_get(
+            self._snap._handle, self._name_bytes, len(self._name_bytes),
+            doc_id, C.byref(buf),
+        )
+        if rc == _ffi.PYX_NOT_FOUND:
+            return None
+        _check(rc)
+        return _read_buf(buf)
+
+    def __iter__(self) -> Iterator[tuple[int, dict]]:
+        return self._snap._db.collection(self._name)._iter(self._snap._handle)
+
+    def find_one(self, field: str, value: ScalarValue) -> Optional[int]:
+        pins: list = []
+        v = _to_pyx_value(value, pins)
+        out = C.c_uint64()
+        cb = _utf8(field)
+        rc = _ffi.pyx_snapshot_find_one(
+            self._snap._handle, self._name_bytes, len(self._name_bytes),
+            cb, len(cb), C.byref(v), C.byref(out),
+        )
+        del pins
+        if rc == _ffi.PYX_NOT_FOUND:
+            return None
+        _check(rc)
+        return int(out.value)
+
+    def find_range(
+        self,
+        field: str,
+        lo: Optional[Bound] = None,
+        hi: Optional[Bound] = None,
+    ) -> Iterator[int]:
+        return self._snap._db.collection(self._name)._range(field, lo, hi, self._snap._handle)

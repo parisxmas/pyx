@@ -1,0 +1,30 @@
+# Zig
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Local scratch / bench dirs
+.bench-tmp/
+.cabi-test/
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Claude Code local state
+.claude/
+
+# Python (bindings/python)
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# Bundled native libs — produced at wheel build time, never commit
+bindings/python/pyx/libpyx.dylib
+bindings/python/pyx/libpyx.so
+bindings/python/pyx/pyx.dll

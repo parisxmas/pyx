@@ -1,0 +1,11 @@
+# Bundled at wheel build time — never commit.
+pyx/libpyx.dylib
+pyx/libpyx.so
+pyx/pyx.dll
+
+# Build artifacts.
+build/
+dist/
+*.egg-info/
+__pycache__/
+.pytest_cache/
