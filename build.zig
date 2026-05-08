@@ -139,6 +139,23 @@ pub fn build(b: *std.Build) void {
     const bench_wp_step = b.step("bench-writer-profile", "Run write-only profile target");
     bench_wp_step.dependOn(&bench_wp_cmd.step);
 
+    // Snapshot-capture latency microbench.
+    const bench_snap = b.addExecutable(.{
+        .name = "pyx-bench-snapshot",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_snapshot.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "pyx", .module = mod }},
+        }),
+    });
+    b.installArtifact(bench_snap);
+    const bench_snap_cmd = b.addRunArtifact(bench_snap);
+    bench_snap_cmd.step.dependOn(b.getInstallStep());
+    const bench_snap_step = b.step("bench-snapshot", "Run snapshot-capture latency microbench");
+    bench_snap_step.dependOn(&bench_snap_cmd.step);
+
     // Read-only profile target.
     const bench_rp = b.addExecutable(.{
         .name = "pyx-bench-reader-profile",

@@ -247,6 +247,40 @@ pub const Pager = struct {
         self.page_cache.clearRetainingCapacity();
     }
 
+    /// Soft-flush variant for snapshot capture. Pushes every dirty
+    /// page in `page_cache` into the kernel's page cache via
+    /// `pwrite`, but does NOT fsync the data file and does NOT reset
+    /// the WAL. mmap'd snapshots can immediately memcpy the just-
+    /// written bytes (kernel page cache is shared between pwrite and
+    /// mmap), and durability is still covered by the un-truncated
+    /// WAL — a crash here replays the WAL on next open exactly as if
+    /// the soft flush had not happened.
+    ///
+    /// `page_cache` is cleared on the way out so a subsequent
+    /// `flushForSnapshot` does no work, keeping per-snapshot capture
+    /// near-O(1) when there are no in-flight commits between
+    /// snapshots.
+    ///
+    /// Skipping the two fsyncs (data file + WAL truncate) saves
+    /// ~30-40us per snapshot on macOS APFS — significant for OCC
+    /// workloads where every `beginOptimistic` captures a fresh
+    /// snapshot.
+    pub fn flushForSnapshot(self: *Pager) !void {
+        if (self.in_txn) return Error.TxnAlreadyActive;
+
+        var it = self.page_cache.iterator();
+        while (it.next()) |e| {
+            if (e.key_ptr.* == 0) continue;
+            try self.file.writePositionalAll(self.io, e.value_ptr.*, pageOffset(e.key_ptr.*));
+        }
+        if (self.page_cache.get(0)) |hbuf| {
+            try self.file.writePositionalAll(self.io, hbuf, 0);
+        }
+        // No fsync. No wal.reset. Free the in-memory copies — kernel
+        // page cache holds the data now and mmap reads through it.
+        self.clearCache();
+    }
+
     /// Flush all cached pages to the DB file, fsync, and truncate the WAL.
     /// This is the only path that writes the on-disk DB file; commits leave
     /// modifications in `page_cache` for batched application here.

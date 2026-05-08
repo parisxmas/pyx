@@ -301,11 +301,14 @@ pub const Db = struct {
     /// thread can issue `get`/`iterator` calls concurrently with writers
     /// on the main thread, with no mutex acquisition on the read path.
     ///
-    /// Implementation: we acquire the mutex briefly, force a `checkpoint`
-    /// so every page reachable from the captured root is durable on disk,
-    /// then release the mutex. Subsequent reads bypass the page cache and
-    /// pager state entirely — they go straight to the file via `pread`,
-    /// which POSIX guarantees is thread-safe per file descriptor.
+    /// Implementation: acquire the mutex briefly, soft-flush the page
+    /// cache so every page reachable from the captured root is at
+    /// least in the kernel's page cache (mmap reads share that), then
+    /// release the mutex. We do NOT fsync — the WAL covers durability,
+    /// and mmap doesn't need on-disk durability to read back the
+    /// just-pwritten bytes. Subsequent reads bypass the userspace page
+    /// cache and pager state entirely; they go straight to the mmap
+    /// (or pread) which POSIX guarantees thread-safe per fd.
     ///
     /// Inside an explicit transaction (`ownsTxn` true), the snapshot
     /// keeps the pager-mediated read path because the cache may still
@@ -324,7 +327,7 @@ pub const Db = struct {
         }
         self.mu.lockUncancelable(self.pager.io);
         defer self.mu.unlock(self.pager.io);
-        try self.pager.checkpoint();
+        try self.pager.flushForSnapshot();
         const file_len = try self.pager.file.length(self.pager.io);
         // mmap a read-only view of the data file at its current size.
         // CoW means subsequent writers append new pages past `file_len`;
