@@ -560,6 +560,10 @@ bindings/python/    ctypes-based Python wrapper
   tests/            pytest suite
   pyproject.toml    PEP 517 build config
 
+realworldexamples/  end-to-end integration demos
+  django/           a Django notes app using pyx as its only store
+                    (lock-free list view, OCC-on-edit, compound index)
+
 build.zig           build graph (lib, exe, tests, benches)
 CHANGELOG.md        release notes (Keep a Changelog format)
 ```

@@ -1,0 +1,8 @@
+# pyx data file generated at runtime
+notes.pyx
+notes.pyx-*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/

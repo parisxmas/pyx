@@ -1,0 +1,6 @@
+Django>=5.0,<6.0
+
+# pyx Python binding — installed editable from the repo so this example
+# always uses the local source. If you copy this directory out, replace
+# with `pyx-db>=0.2.0` once it's on PyPI.
+-e ../../bindings/python

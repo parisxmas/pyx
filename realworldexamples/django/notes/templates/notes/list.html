@@ -1,0 +1,35 @@
+{% extends "notes/base.html" %}
+{% block title %}Notes — {{ user_id }}{% endblock %}
+{% block content %}
+<h1>Notes
+{% if tag_filter %}
+    — tag: <span class="tag">{{ tag_filter }}</span>
+    <small>(<a href="{% url 'notes:list' %}?u={{ user_id }}">clear</a>)</small>
+{% endif %}
+</h1>
+
+<form method="post" action="{% url 'notes:create' %}">
+    <input type="hidden" name="u" value="{{ user_id }}">
+    <input type="text" name="title" placeholder="Title" required>
+    <textarea name="body" rows="3" placeholder="Body…"></textarea>
+    <input type="text" name="tags" placeholder="comma, separated, tags">
+    <button type="submit">Create</button>
+</form>
+
+<hr>
+
+{% for n in notes %}
+    <article class="note">
+        <h3><a href="{% url 'notes:detail' n._id %}?u={{ user_id }}">{{ n.title }}</a></h3>
+        <p>{{ n.body|truncatewords:25 }}</p>
+        <p>
+            {% for t in n.tags %}
+                <a class="tag" href="{% url 'notes:list' %}?u={{ user_id }}&tag={{ t }}">{{ t }}</a>
+            {% endfor %}
+        </p>
+        <p class="meta">updated {{ n.updated_at }}</p>
+    </article>
+{% empty %}
+    <p>No notes{% if tag_filter %} match this tag{% endif %}.</p>
+{% endfor %}
+{% endblock %}

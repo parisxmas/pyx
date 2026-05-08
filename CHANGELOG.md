@@ -13,6 +13,13 @@ tag goes under `## Unreleased`.
   Layout reserves 4 KB for cross-process state (magic, version,
   shared atomic counters); `next_doc_id` is the first counter moved
   into shm.
+- `realworldexamples/django/` — a working Django app using pyx as
+  its primary store (no SQL, no ORM). Notes app demonstrates the
+  practical patterns: `db.snapshot()` for lock-free list reads,
+  `db.run_optimistic` for safe concurrent edits, compound index on
+  `(user_id, tag)`, and the single-process deployment constraint.
+  Includes README, settings, views, templates, and an editable
+  `requirements.txt` that wires up the local Python binding.
 - Multi-process foundation, phase 1C (in progress): `src/flock.zig`
   introduces a thin POSIX byte-range advisory-lock wrapper around
   `fcntl(F_SETLK / F_SETLKW)` — `lock` (blocking), `tryLock`

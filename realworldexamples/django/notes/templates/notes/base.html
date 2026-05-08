@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>{% block title %}Notes{% endblock %}</title>
+    <style>
+        body { font-family: -apple-system, system-ui, sans-serif; max-width: 720px; margin: 2em auto; padding: 0 1em; line-height: 1.5; }
+        a { color: #1f4e79; }
+        h1 { border-bottom: 1px solid #ddd; padding-bottom: .3em; }
+        nav a { margin-right: 1em; }
+        article.note { padding: 1em; border: 1px solid #eee; border-radius: 6px; margin-bottom: 1em; }
+        .tag { display: inline-block; padding: 2px 8px; background: #eef; border-radius: 10px; margin-right: 4px; font-size: 90%; }
+        .meta { color: #888; font-size: 90%; }
+        textarea, input[type=text] { width: 100%; box-sizing: border-box; padding: .5em; font-family: inherit; }
+        button { padding: .5em 1em; background: #1f4e79; color: white; border: 0; border-radius: 4px; cursor: pointer; }
+        button.danger { background: #c43; }
+    </style>
+</head>
+<body>
+    <nav>
+        <a href="{% url 'notes:list' %}?u={{ request.GET.u|default:'demo' }}">All notes</a>
+        | user: <code>{{ request.GET.u|default:'demo' }}</code>
+        — change with <code>?u=alice</code>
+    </nav>
+    {% block content %}{% endblock %}
+</body>
+</html>

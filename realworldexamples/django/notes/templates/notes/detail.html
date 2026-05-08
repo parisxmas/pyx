@@ -1,0 +1,19 @@
+{% extends "notes/base.html" %}
+{% block title %}{{ note.title }}{% endblock %}
+{% block content %}
+<h1>{{ note.title }}</h1>
+<p>{{ note.body|linebreaksbr }}</p>
+<p>
+    {% for t in note.tags %}<span class="tag">{{ t }}</span>{% endfor %}
+</p>
+<p class="meta">created {{ note.created_at }} · updated {{ note.updated_at }}</p>
+
+<form method="get" action="{% url 'notes:edit' note._id %}" style="display:inline">
+    <input type="hidden" name="u" value="{{ request.GET.u|default:'demo' }}">
+    <button type="submit">Edit</button>
+</form>
+<form method="post" action="{% url 'notes:delete' note._id %}" style="display:inline">
+    <input type="hidden" name="u" value="{{ request.GET.u|default:'demo' }}">
+    <button type="submit" class="danger">Delete</button>
+</form>
+{% endblock %}
