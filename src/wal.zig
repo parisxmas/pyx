@@ -95,6 +95,12 @@ pub const Wal = struct {
     /// `sync_mu`). Atomic so the cross-mutex visibility is well-defined.
     last_flushed_lsn: std.atomic.Value(u64),
 
+    // === Group-commit diagnostics (atomics so callers can read without sync_mu) ===
+    leader_cycles: std.atomic.Value(u64),     // times this thread did the fsync
+    follower_waits: std.atomic.Value(u64),    // times this thread parked on cv
+    fast_returns: std.atomic.Value(u64),      // covered before entering the wait loop
+    fsync_total_ns: std.atomic.Value(u64),    // sum of fsync syscall durations
+
     pub fn open(allocator: Allocator, io: Io, dir: Dir, sub_path: []const u8) !Wal {
         const file = try dir.createFile(io, sub_path, .{
             .read = true,
@@ -121,6 +127,10 @@ pub const Wal = struct {
                 .leader_active = false,
                 .fsynced_lsn = 0,
                 .last_flushed_lsn = .init(0),
+                .leader_cycles = .init(0),
+                .follower_waits = .init(0),
+                .fast_returns = .init(0),
+                .fsync_total_ns = .init(0),
             };
         }
         if (len < wal_header_size) return Error.TruncatedWal;
@@ -140,6 +150,10 @@ pub const Wal = struct {
             .leader_active = false,
             .fsynced_lsn = 0,
             .last_flushed_lsn = .init(0),
+            .leader_cycles = .init(0),
+            .follower_waits = .init(0),
+            .fast_returns = .init(0),
+            .fsync_total_ns = .init(0),
         };
     }
 
@@ -256,18 +270,31 @@ pub const Wal = struct {
         self.sync_mu.lockUncancelable(self.io);
         defer self.sync_mu.unlock(self.io);
 
+        if (self.fsynced_lsn >= my_lsn) {
+            _ = self.fast_returns.fetchAdd(1, .monotonic);
+            return;
+        }
+
         while (self.fsynced_lsn < my_lsn) {
             if (!self.leader_active) {
                 self.leader_active = true;
-                // Take the watermark BEFORE issuing fsync. fsync
-                // guarantees writes whose pwritev completed before this
-                // call are durable; anything later is unknown, so we
-                // intentionally don't credit followers whose flush races
-                // the syscall.
-                const watermark = self.last_flushed_lsn.load(.acquire);
+                _ = self.leader_cycles.fetchAdd(1, .monotonic);
                 self.sync_mu.unlock(self.io);
 
+                const t0 = Io.Clock.Timestamp.now(self.io, .awake);
                 const sync_result = self.file.sync(self.io);
+                const t1 = Io.Clock.Timestamp.now(self.io, .awake);
+                _ = self.fsync_total_ns.fetchAdd(
+                    @intCast(t1.raw.toNanoseconds() - t0.raw.toNanoseconds()),
+                    .monotonic,
+                );
+
+                // Take the watermark AFTER fsync returns. On Linux ext4 /
+                // macOS APFS, fsync acts as a barrier covering every
+                // pwritev to the inode that completed before the syscall
+                // returned, so writers whose commitAppend ran while the
+                // leader was inside the syscall are credited too.
+                const watermark = self.last_flushed_lsn.load(.acquire);
 
                 self.sync_mu.lockUncancelable(self.io);
                 self.leader_active = false;
@@ -275,17 +302,37 @@ pub const Wal = struct {
                     if (watermark > self.fsynced_lsn) self.fsynced_lsn = watermark;
                     self.sync_cv.broadcast(self.io);
                 } else |err| {
-                    // Wake everyone so they can either retry as leader or
-                    // bubble the error out. Don't advance fsynced_lsn.
                     self.sync_cv.broadcast(self.io);
                     return err;
                 }
-                // Loop and re-check; if our my_lsn was past the leader's
-                // snapshot watermark, we'll become leader next iteration.
             } else {
+                _ = self.follower_waits.fetchAdd(1, .monotonic);
                 self.sync_cv.waitUncancelable(self.io, &self.sync_mu);
             }
         }
+    }
+
+    pub const SyncStats = struct {
+        leader_cycles: u64,
+        follower_waits: u64,
+        fast_returns: u64,
+        fsync_total_ns: u64,
+    };
+
+    pub fn readSyncStats(self: *const Wal) SyncStats {
+        return .{
+            .leader_cycles = self.leader_cycles.load(.monotonic),
+            .follower_waits = self.follower_waits.load(.monotonic),
+            .fast_returns = self.fast_returns.load(.monotonic),
+            .fsync_total_ns = self.fsync_total_ns.load(.monotonic),
+        };
+    }
+
+    pub fn resetSyncStats(self: *Wal) void {
+        self.leader_cycles.store(0, .monotonic);
+        self.follower_waits.store(0, .monotonic);
+        self.fast_returns.store(0, .monotonic);
+        self.fsync_total_ns.store(0, .monotonic);
     }
 
     pub fn reset(self: *Wal) !void {

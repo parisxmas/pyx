@@ -260,6 +260,7 @@ fn runMultiWriterSweep(
     defer db.setSyncMode(.normal);
     for (writer_counts) |W| {
         try db.checkpoint();
+        db.pager.wal.resetSyncStats();
         const deadline = nowNs(io) + SECS_MULTI_WRITER * std.time.ns_per_s;
         const threads = try ally.alloc(std.Thread, W);
         defer ally.free(threads);
@@ -284,11 +285,29 @@ fn runMultiWriterSweep(
         var total: u64 = 0;
         for (ops_per_thread) |o| total += o;
         const elapsed_ns = SECS_MULTI_WRITER * std.time.ns_per_s;
-        try out.print("  {d:>2} writers: {d:>10} commits/s aggregate ({d:.0} commits/s/thread)\n", .{
-            W,
-            @as(u64, @intFromFloat(opsPerSec(total, elapsed_ns))),
-            opsPerSec(total, elapsed_ns) / @as(f64, @floatFromInt(W)),
-        });
+        const stats = db.pager.wal.readSyncStats();
+        const coalesce_ratio: f64 = if (stats.leader_cycles == 0)
+            0
+        else
+            @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(stats.leader_cycles));
+        const fsync_avg_us: f64 = if (stats.leader_cycles == 0)
+            0
+        else
+            @as(f64, @floatFromInt(stats.fsync_total_ns)) /
+                @as(f64, @floatFromInt(stats.leader_cycles)) / 1000.0;
+        try out.print(
+            "  W={d}: {d:>7} commits/s ({d:.0}/thr) | fsync avg {d:.1}us | leaders {d}, waits {d}, fast {d} | {d:.2} commits/fsync\n",
+            .{
+                W,
+                @as(u64, @intFromFloat(opsPerSec(total, elapsed_ns))),
+                opsPerSec(total, elapsed_ns) / @as(f64, @floatFromInt(W)),
+                fsync_avg_us,
+                stats.leader_cycles,
+                stats.follower_waits,
+                stats.fast_returns,
+                coalesce_ratio,
+            },
+        );
     }
     try out.print("\n", .{});
 }
