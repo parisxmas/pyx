@@ -7,6 +7,28 @@ tag goes under `## Unreleased`.
 
 ## Unreleased
 
+## 0.3.0 — 2026-05-08
+
+The headline of 0.3.0 is **multi-process safety**: opening the same
+`.pyx` file from N processes (e.g. `gunicorn --workers 4`) now Just
+Works. Cross-process visibility of committed writes, a single
+machine-wide WRITER lock around the commit pipeline, and a shared
+`-shm` sidecar file mmap'd MAP_SHARED carry the runtime counters
+that used to be per-process.
+
+Verified empirically: 1000 parallel POSTs across 4 gunicorn workers
+in ~1.2 s (≈830 commits/s aggregate, all 1000 docs preserved); 50
+concurrent OCC edits of the same note all succeeding via auto-retry;
+8 processes × 200 inserts → 1600 docs preserved per trial.
+
+Other meaningful work in this release: **compound indexes** (Zig +
+C ABI + Python; ordered prefix matching, max 16 fields), an OCC
+hardening pass (implicit-read on `put`/`delete` to close the
+lost-update gap; range-read tracking for `findOne`/`findAll`/
+`findRange`/iterator with phantom protection at commit), exponential
+backoff with full jitter in `runOptimistic`, and a soft-flush
+snapshot path that drops capture latency from ~75 µs to ~15 µs.
+
 ### Changed
 - README's "Concurrency model" lock-byte table updated to reflect
   the WRITER-only protocol (the RECOVERY byte is gone). Django
@@ -220,5 +242,6 @@ First tagged release.
   `applyAndFinalize`. `db.zig` writes release `db.mu` between
   apply and fsync, enabling group-commit coalescing.
 
-[Unreleased]: https://github.com/parisxmas/pyx/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/parisxmas/pyx/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/parisxmas/pyx/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/parisxmas/pyx/releases/tag/v0.2.0
