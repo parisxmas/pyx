@@ -222,7 +222,12 @@ pub const Pager = struct {
         // automatically (per-process POSIX semantics).
         const got_excl = flock_mod.tryLock(file.handle, .write, recovery_lock_region) catch false;
         if (got_excl) {
-            shm.seedFromHeader(header.next_doc_id, header.num_pages, 1);
+            shm.seedFromHeader(
+                header.next_doc_id,
+                header.num_pages,
+                1, // next_lsn placeholder; replay's restoreNextLsn updates
+                @intCast(header.btree_root),
+            );
         }
         // Replace our (write or no) lock with shared. If the prior
         // attempt succeeded, this downgrades exclusive→shared; if it
@@ -317,8 +322,17 @@ pub const Pager = struct {
     /// Flush all cached pages to the DB file, fsync, and truncate the WAL.
     /// This is the only path that writes the on-disk DB file; commits leave
     /// modifications in `page_cache` for batched application here.
+    ///
+    /// Takes the cross-process WRITER fcntl lock so it can't race a
+    /// concurrent committer's WAL append. Skipped during recovery.
     pub fn checkpoint(self: *Pager) !void {
         if (self.in_txn) return Error.TxnAlreadyActive;
+        if (!self.in_recovery) {
+            try flock_mod.lock(self.file.handle, .write, writer_lock_region);
+        }
+        defer if (!self.in_recovery) {
+            flock_mod.unlock(self.file.handle, writer_lock_region) catch {};
+        };
 
         // Apply non-header pages first; header page 0 last, so a crash
         // mid-flush leaves the live tree pointing at the previous root.
@@ -365,11 +379,18 @@ pub const Pager = struct {
             flock_mod.unlock(self.file.handle, writer_lock_region) catch {};
         };
 
-        // Capture the live page count from shm so abort can restore it
-        // — `txn_header_snapshot.num_pages` is now the pre-txn shm
-        // value, not the (possibly stale) on-disk header value.
+        // Now that we hold the WRITER lock, refresh our in-process
+        // header from shm. Another process may have committed while
+        // we were waiting; we must build on top of THEIR root, not
+        // our (stale) cached one. shm is the cross-process source of
+        // truth for the live counters; the in-process header is just
+        // a working copy.
+        self.header.btree_root = @intCast(self.shm.btreeRoot().load(.acquire));
+        self.header.num_pages = self.shm.numPages().load(.acquire);
+        self.header.next_doc_id = self.shm.nextDocId().load(.acquire);
+
+        // Capture the live page count for abort rollback.
         self.txn_header_snapshot = self.header;
-        self.txn_header_snapshot.num_pages = self.shm.numPages().load(.monotonic);
         self.in_txn = true;
     }
 
@@ -416,6 +437,10 @@ pub const Pager = struct {
             self.header.num_pages = live_num_pages;
             self.header_dirty = true;
         }
+        // btree_root flows the OTHER direction: the in-txn header is
+        // the source of truth (updated by setBTreeRoot during the
+        // txn), and applyAndFinalize stores it into shm AFTER all
+        // dirty pages are on disk. Skip the live-root sync here.
 
         if (self.header_dirty) {
             const gop = try self.dirty.getOrPut(self.allocator, 0);
@@ -476,21 +501,36 @@ pub const Pager = struct {
     /// `page_cache`; if the same page is already in the cache (overridden
     /// by this txn), the old cached buffer is freed.
     pub fn applyAndFinalize(self: *Pager) !void {
+        // Phase 2B: pwrite every dirty page directly to the file
+        // (kernel page cache; no fsync — durability is the WAL's job).
+        // Then atomically advance shm.btreeRoot. Other processes that
+        // open this DB or read through their own shm see the new root
+        // pointing at pages that are already in the OS file cache, so
+        // their reads come back consistent.
+        //
+        // Order matters: ALL pages must be pwritten before the shm
+        // root store. We use .release on the store so the prior pwrite
+        // syscalls happen-before any reader's .acquire load.
         var it = self.dirty.iterator();
         while (it.next()) |e| {
-            const gop = try self.page_cache.getOrPut(self.allocator, e.key_ptr.*);
-            if (gop.found_existing) self.allocator.destroy(gop.value_ptr.*);
-            gop.value_ptr.* = e.value_ptr.*;
+            if (e.key_ptr.* == 0) continue; // header pwritten last
+            try self.file.writePositionalAll(self.io, e.value_ptr.*, pageOffset(e.key_ptr.*));
+            self.allocator.destroy(e.value_ptr.*);
         }
-        self.dirty.clearRetainingCapacity(); // ownership moved; do NOT destroy values
+        if (self.dirty.get(0)) |hbuf| {
+            try self.file.writePositionalAll(self.io, hbuf, 0);
+            self.allocator.destroy(hbuf);
+        }
+        self.dirty.clearRetainingCapacity();
+        // Publish the new root. Any reader on another process that
+        // sees this value can dereference it against the file safely.
+        self.shm.btreeRoot().store(@intCast(self.header.btree_root), .release);
+
         self.pending.clearRetainingCapacity();
         _ = self.txn_arena.reset(.retain_capacity);
         self.txn_append_hint = null;
         self.header_dirty = false;
         self.in_txn = false;
-        // Release the cross-process WRITER lock now that the txn's
-        // shm mutations are complete. Other processes blocked in
-        // `pager.begin` will see them via the shared mmap.
         if (!self.in_recovery) {
             flock_mod.unlock(self.file.handle, writer_lock_region) catch {};
         }
@@ -687,6 +727,10 @@ pub const Pager = struct {
     pub fn setBTreeRoot(self: *Pager, id: PageId) !void {
         if (self.header.btree_root == id) return; // no-op if unchanged
         if (self.in_txn) {
+            // Update only the in-process header during the txn — shm
+            // is updated atomically at applyAndFinalize, AFTER all
+            // dirty pages are on disk, so other processes never see a
+            // root pointing at pages the file doesn't have yet.
             self.header.btree_root = id;
             self.header_dirty = true;
             return;
@@ -698,8 +742,14 @@ pub const Pager = struct {
         try self.commit();
     }
 
-    pub fn bTreeRoot(self: *const Pager) PageId {
-        return self.header.btree_root;
+    /// The live B+Tree root. Inside a txn, this is the in-process
+    /// header's value — the work-in-progress root that subsequent
+    /// reads (e.g. index lookups during a multi-op write) must walk.
+    /// Outside a txn, it's the shm-resident value, so any process
+    /// that has the DB open sees the latest committed root.
+    pub fn bTreeRoot(self: *Pager) PageId {
+        if (self.in_txn) return self.header.btree_root;
+        return @intCast(self.shm.btreeRoot().load(.acquire));
     }
 
     /// Whether `id` was allocated/modified earlier in the current

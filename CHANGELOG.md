@@ -25,6 +25,35 @@ tag goes under `## Unreleased`.
   404. The template-language constraint that variable names can't
   start with `_` led to renaming the dict's `_id` key to `doc_id`
   in views and templates.
+- Multi-process foundation, phase 2A+2B: cross-process write
+  visibility actually works for the simple case.
+  - shm gains `btree_root` atomic (phase 2A). `Pager.bTreeRoot`
+    returns the in-process header during a txn (work-in-progress
+    root) and the shm value otherwise (cross-process latest).
+  - `applyAndFinalize` no longer accumulates committed pages in an
+    in-process `page_cache`. Instead it pwrites every dirty page
+    directly to the data file under the WRITER lock (kernel page
+    cache visibility — no fsync; durability still on the WAL),
+    then atomically stores `header.btree_root` into shm. Order of
+    operations matters: pages first, then root, with `.release` /
+    `.acquire` semantics.
+  - `Pager.begin`, after acquiring WRITER, refreshes the in-process
+    header's `btree_root`, `num_pages`, and `next_doc_id` from shm
+    so a process that's been waiting on the lock builds on top of
+    whatever was committed while it slept.
+  - `Pager.checkpoint` now also takes the WRITER lock so it can't
+    truncate the WAL during a concurrent committer's append.
+  - Verified: two processes each inserting 200 docs into the same
+    DB → 400 docs preserved, byte-identical to single-process. The
+    Django example would now be safe under `--workers 1 --threads N`
+    on multiple gunicorn instances backing a load balancer (the
+    earlier-stated limitation no longer applies for that pattern).
+  - Known residual: 4-process simultaneous open from a fresh DB
+    has a flaky `InvalidPageId` once in a while — likely a race in
+    the open/seed path under heavy concurrent first-opener
+    contention. Two-process and serial-open scenarios are clean.
+    Investigation continues; for now the README's
+    single-process advice still applies for ≥4 concurrent openers.
 - Multi-process foundation, phase 1C: `src/flock.zig` POSIX byte-
   range advisory-lock wrapper, plus the Pager-side wiring:
   - WRITER lock (byte 0 of the data file) around `pager.begin` →

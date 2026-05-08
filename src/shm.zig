@@ -5,7 +5,7 @@
 //! first 4 KB as MAP_SHARED, so writes from one process are immediately
 //! visible to others on the same machine.
 //!
-//! Phase 1 layout:
+//! Layout:
 //!   bytes 0..8     magic "PYXSHM01"
 //!   bytes 8..12    layout version (currently 1)
 //!   bytes 16..24   next_doc_id      (atomic u64)
@@ -14,7 +14,12 @@
 //!   bytes 40..48   wal_end_offset   (atomic u64)
 //!   bytes 48..56   writer_pid       (debug; 0 when no writer holds the
 //!                                    fcntl WRITER lock — added in phase 1C)
-//!   bytes 56..4096 reserved
+//!   bytes 56..64   btree_root       (atomic u64, phase 2A; the live
+//!                                    root of the B+Tree, shared across
+//!                                    processes. Stored as u64 here for
+//!                                    layout regularity even though
+//!                                    PageId is u32; reads narrow.)
+//!   bytes 64..4096 reserved
 //!
 //! Phase 2 will add a wal-index hash table after the header. Phase 3
 //! adds a reader-mark slot array. The 4 KB header reservation gives
@@ -48,8 +53,9 @@ pub const Header = extern struct {
     next_lsn: u64 align(8),
     wal_end_offset: u64 align(8),
     writer_pid: u64 align(8),
+    btree_root: u64 align(8),
     /// Pads the struct to 4096 bytes for forward compatibility.
-    _reserved: [shm_size - 56]u8,
+    _reserved: [shm_size - 64]u8,
 };
 
 comptime {
@@ -59,6 +65,7 @@ comptime {
     std.debug.assert(@offsetOf(Header, "next_lsn") == 32);
     std.debug.assert(@offsetOf(Header, "wal_end_offset") == 40);
     std.debug.assert(@offsetOf(Header, "writer_pid") == 48);
+    std.debug.assert(@offsetOf(Header, "btree_root") == 56);
 }
 
 pub const Shm = struct {
@@ -139,6 +146,10 @@ pub const Shm = struct {
         return @ptrCast(@alignCast(&self.header().wal_end_offset));
     }
 
+    pub fn btreeRoot(self: *Shm) *std.atomic.Value(u64) {
+        return @ptrCast(@alignCast(&self.header().btree_root));
+    }
+
     /// Seed every atomic counter from the values the on-disk DB header
     /// has at open time. Called by the first opener — phase 1 always
     /// calls it (single-process); phase 1C will gate it on the
@@ -149,10 +160,12 @@ pub const Shm = struct {
         next_doc_id: u64,
         num_pages: u64,
         next_lsn: u64,
+        btree_root: u64,
     ) void {
         self.nextDocId().store(next_doc_id, .release);
         self.numPages().store(num_pages, .release);
         self.nextLsn().store(next_lsn, .release);
+        self.btreeRoot().store(btree_root, .release);
         // wal_end_offset is owned by Wal — set when the WAL is opened.
     }
 };
