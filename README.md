@@ -261,9 +261,22 @@ guarantees is thread-safe per fd). Because the B+Tree is copy-on-write,
 pages reachable from the captured root are never mutated; writers append
 new pages past the snapshot's mapped length.
 
-The current engine is **single-writer**. Concurrent auto-commit writes
-from many threads are correct (they serialise on the mutex), but they do
-not parallelise. Multi-writer is a v1 work item.
+The current engine is **single-writer at the B+Tree** — concurrent
+auto-commit writes from many threads are correct (they serialise on
+`db.mu`) but B+Tree mutations don't parallelise. Group commit *does*
+collapse fsync syscalls across concurrent `.full`-mode writers via a
+leader/follower queue in the WAL: the first arrival snapshots the
+in-kernel write watermark, fsyncs once, and broadcasts to followers
+whose commits fall under that watermark. This gives a small win in
+practice (1.4× at 2 writers on macOS APFS, plateauing past that),
+because once fsync is fast enough that one writer's iteration matches
+the next's traversal of `db.mu`, the followers don't pile up at the
+fsync queue and `db.mu` becomes the ceiling rather than fsync.
+
+Concurrent B+Tree mutations (per-page locks) are the v2 path to
+breaking past the `db.mu` ceiling. Until then, batching multiple ops
+into one explicit transaction (`begin` / `op` × N / `commit`) is
+already the right answer for write-heavy workloads.
 
 ---
 
@@ -324,6 +337,38 @@ scaling because they don't touch the writer's mutex at all.
 `zig build bench-concurrent` / `zig build bench-concurrent-sqlite` to
 reproduce.
 
+### Multi-writer auto-commit, .full mode
+
+Phase C of `bench-concurrent`: N writer threads, each issuing
+auto-commit inserts (one doc per commit) in `.full` durability mode —
+every commit must be on disk before the call returns. This is the
+workload group commit was designed for. Median of 5 runs, 1 s per
+sub-phase:
+
+| Writers | commits/s | fsync avg | commits per fsync |
+|---------|----------:|----------:|------------------:|
+| 1       |  ~32 k    | 15 µs     | 1.00              |
+| 2       |  ~46 k    | 15 µs     | 1.00              |
+| 4       |  ~44 k    | 15 µs     | 1.00              |
+| 8       |  ~44 k    | 15 µs     | 1.00              |
+
+The 1.4× lift from W=1 to W=2 is the realised group-commit win —
+removing redundant fsyncs in the rare cases where a follower's
+`commitAppend` overlaps a leader's fsync. Past W=2 the curve flattens:
+on Apple M4 / APFS, fsync is **15 µs** and `db.mu` hold time
+(`commitAppend` + `applyAndFinalize`) is **~15 µs**, so by the time
+follower B traverses `db.mu` and reaches the fsync queue, leader A has
+already finished and reset `leader_active`. The protocol's diagnostic
+counters confirm this: `commits/fsync = 1.00` everywhere, and
+`follower_waits` is single-digit out of tens of thousands of commits.
+
+The structural ceiling at this concurrency is `db.mu`, not fsync.
+Group commit pays its way at W=2 and is harmless past that, but
+breaking past ~45 k auto-commits/s in `.full` mode requires concurrent
+B+Tree mutations under per-page locks (roadmap, v2). For write-heavy
+workloads today, **batched transactions** are the right answer — the
+single-thread batched-insert path already hits 4 M ops/s.
+
 ### Caveats
 
 - These are microbenchmarks. The workload is small documents (~30 B
@@ -332,9 +377,11 @@ reproduce.
 - macOS APFS `fsync` semantics differ from Linux `ext4`/`xfs`; absolute
   numbers will move on Linux, but the relative shape (lock-free
   snapshot reads vs WAL-index contention) is the same.
-- pyx is single-writer; SQLite is also effectively single-writer in
-  WAL mode. The 1w+Nr numbers measure that case fairly. Multi-writer
-  is not yet implemented in pyx.
+- pyx is single-writer at the B+Tree; SQLite is also effectively
+  single-writer in WAL mode. The 1w+Nr numbers measure that case
+  fairly. Group commit (leader/follower fsync coalescing) is
+  implemented and gives the 1.4× win at W=2 in the multi-writer table
+  above; concurrent B+Tree mutations are not yet implemented.
 - The auto-commit insert path fsyncs less often in `normal` mode,
   matching SQLite's `synchronous=NORMAL`. With pyx's default
   `full` mode (fsync per commit), auto-commit insert drops by roughly
@@ -389,7 +436,9 @@ Python tests live under `bindings/python/tests/` and are run with
 
 ## Roadmap
 
-- [ ] Multi-writer (per-page locks or group commit).
+- [x] Group commit (leader/follower fsync coalescing in the WAL).
+- [ ] Concurrent B+Tree mutations (per-page locks) — the next move past
+      the `db.mu` ceiling for `.full`-mode auto-commit throughput.
 - [ ] Compound indexes.
 - [ ] Streaming `findRange` paging cursor in the C ABI.
 - [ ] Background checkpointer.
