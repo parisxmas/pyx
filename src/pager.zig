@@ -236,6 +236,7 @@ pub const Pager = struct {
                 header.num_pages,
                 1, // next_lsn placeholder; replay's restoreNextLsn updates
                 @intCast(header.btree_root),
+                @intCast(header.free_head),
             );
         }
 
@@ -398,6 +399,7 @@ pub const Pager = struct {
         self.header.btree_root = @intCast(self.shm.btreeRoot().load(.acquire));
         self.header.num_pages = self.shm.numPages().load(.acquire);
         self.header.next_doc_id = self.shm.nextDocId().load(.acquire);
+        self.header.free_head = @intCast(self.shm.freeHead().load(.acquire));
 
         // Capture the live page count for abort rollback.
         self.txn_header_snapshot = self.header;
@@ -532,8 +534,10 @@ pub const Pager = struct {
             self.allocator.destroy(hbuf);
         }
         self.dirty.clearRetainingCapacity();
-        // Publish the new root. Any reader on another process that
-        // sees this value can dereference it against the file safely.
+        // Publish the new root + free-list head. Any reader on
+        // another process that sees these values can dereference
+        // them against the file safely.
+        self.shm.freeHead().store(@intCast(self.header.free_head), .release);
         self.shm.btreeRoot().store(@intCast(self.header.btree_root), .release);
 
         self.pending.clearRetainingCapacity();

@@ -284,27 +284,55 @@ elsewhere.
 
 ## Concurrency model
 
-Three styles of transaction:
+pyx is a **single-writer, multi-reader, cross-process** embedded
+database — same model as SQLite in WAL mode. Multiple OS processes
+can open the same DB file concurrently; only one is in the commit
+critical section at a time, but reads are lock-free and scale
+across processes (and threads within each).
+
+### Cross-process
+
+A sibling `mydb.pyx-shm` file (mmap'd `MAP_SHARED` by every opener)
+holds the live counters that have to be consistent system-wide:
+`btree_root`, `num_pages`, `next_doc_id`, `next_lsn`,
+`wal_end_offset`, `free_head`. POSIX `fcntl` byte-range advisory
+locks coordinate the rest:
+
+| Lock | When | Effect |
+|---|---|---|
+| RECOVERY (byte 2) | EXCL during `open` → SHARED for lifetime | First opener does the fresh-init; later openers see the inited state. |
+| WRITER (byte 0) | EXCL while a writer is in `begin → applyAndFinalize` (and during `checkpoint`) | One commit at a time, machine-wide. |
+
+Each commit pwrites its dirty pages directly into the data file
+(no in-process page cache hangs onto them), then atomically
+`.release`-stores the new B+Tree root into shm. Other processes'
+`.acquire` loads see pages-then-root in the right order.
+
+`gunicorn --workers 4` against the same pyx file is supported.
+The Django example in `realworldexamples/django/` runs it.
+
+### Three styles of transaction
 
 | Style                          | Begin           | Reads                    | Writes                | Commit                 |
 |--------------------------------|-----------------|--------------------------|-----------------------|------------------------|
-| Pessimistic (`Db.begin`)       | takes `db.mu`   | through page cache       | applied immediately   | release `db.mu`        |
-| Auto-commit                    | takes `db.mu`   | through page cache       | applied immediately   | release `db.mu`        |
-| Optimistic (`Db.beginOptimistic`) | snapshot-only  | **lock-free** via mmap   | buffered until commit | brief `db.mu` for validate + apply |
+| Pessimistic (`Db.begin`)       | `db.mu` + WRITER fcntl | through page cache | applied to file at commit | release WRITER + `db.mu` |
+| Auto-commit                    | `db.mu` + WRITER fcntl | through page cache | applied to file at commit | release WRITER + `db.mu` |
+| Optimistic (`Db.beginOptimistic`) | snapshot-only  | **lock-free** via mmap   | buffered until commit | brief WRITER + `db.mu` for validate + apply |
 
-And readers:
+### Readers
 
-| Operation                         | Lock?               | Multi-thread?              |
-|-----------------------------------|---------------------|----------------------------|
-| `Snapshot` (taken outside a txn)  | **none on reads**   | **N readers, lock-free**   |
-| `Snapshot.findOne` / `findRange`  | **none**            | **N readers, lock-free**   |
-| `Collection.iterator`             | mutex during open   | one thread per iterator    |
+| Operation                         | Lock?               | Multi-thread / multi-process? |
+|-----------------------------------|---------------------|-------------------------------|
+| `Snapshot` (taken outside a txn)  | **none on reads**   | **N readers, lock-free, cross-process** |
+| `Snapshot.findOne` / `findRange`  | **none**            | **N readers, lock-free, cross-process** |
+| `Collection.iterator`             | mutex during open   | one thread per iterator       |
 
 Snapshot reads bypass the page cache and pager state entirely — they
 `memcpy` from an `mmap`'d region (or fall back to `pread`, which POSIX
 guarantees is thread-safe per fd). Because the B+Tree is copy-on-write,
 pages reachable from the captured root are never mutated; writers append
-new pages past the snapshot's mapped length.
+new pages past the snapshot's mapped length, even when those writers
+are in a different process.
 
 ### OCC: optimistic concurrency
 

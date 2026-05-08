@@ -19,7 +19,11 @@
 //!                                    processes. Stored as u64 here for
 //!                                    layout regularity even though
 //!                                    PageId is u32; reads narrow.)
-//!   bytes 64..4096 reserved
+//!   bytes 64..72   free_head        (atomic u64, phase 5; the head of
+//!                                    the free-page list, shared across
+//!                                    processes so freed pages are
+//!                                    visible to everyone)
+//!   bytes 72..4096 reserved
 //!
 //! Phase 2 will add a wal-index hash table after the header. Phase 3
 //! adds a reader-mark slot array. The 4 KB header reservation gives
@@ -54,8 +58,9 @@ pub const Header = extern struct {
     wal_end_offset: u64 align(8),
     writer_pid: u64 align(8),
     btree_root: u64 align(8),
+    free_head: u64 align(8),
     /// Pads the struct to 4096 bytes for forward compatibility.
-    _reserved: [shm_size - 64]u8,
+    _reserved: [shm_size - 72]u8,
 };
 
 comptime {
@@ -66,6 +71,7 @@ comptime {
     std.debug.assert(@offsetOf(Header, "wal_end_offset") == 40);
     std.debug.assert(@offsetOf(Header, "writer_pid") == 48);
     std.debug.assert(@offsetOf(Header, "btree_root") == 56);
+    std.debug.assert(@offsetOf(Header, "free_head") == 64);
 }
 
 pub const Shm = struct {
@@ -150,6 +156,10 @@ pub const Shm = struct {
         return @ptrCast(@alignCast(&self.header().btree_root));
     }
 
+    pub fn freeHead(self: *Shm) *std.atomic.Value(u64) {
+        return @ptrCast(@alignCast(&self.header().free_head));
+    }
+
     /// Seed every atomic counter from the values the on-disk DB header
     /// has at open time. Called by the first opener — phase 1 always
     /// calls it (single-process); phase 1C will gate it on the
@@ -161,11 +171,13 @@ pub const Shm = struct {
         num_pages: u64,
         next_lsn: u64,
         btree_root: u64,
+        free_head: u64,
     ) void {
         self.nextDocId().store(next_doc_id, .release);
         self.numPages().store(num_pages, .release);
         self.nextLsn().store(next_lsn, .release);
         self.btreeRoot().store(btree_root, .release);
+        self.freeHead().store(free_head, .release);
         // wal_end_offset is owned by Wal — set when the WAL is opened.
     }
 };

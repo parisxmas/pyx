@@ -45,6 +45,19 @@ tag goes under `## Unreleased`.
     truncate the WAL during a concurrent committer's append.
   - Verified: two processes each inserting 200 docs into the same
     DB → 400 docs preserved, byte-identical to single-process.
+- Multi-process foundation, phases 3-5 wrap-up: `free_head` joins
+  the shm-resident counters so the free list works across
+  processes (deletes / aborts in one process now actually let
+  another process reuse the freed pages). `pager.begin` refreshes
+  `header.free_head` from shm under the WRITER lock; commits store
+  back. The on-disk header reflects the current value at next
+  applyAndFinalize. README's "Concurrency model" rewritten to
+  describe the SQLite-style single-writer / multi-reader /
+  cross-process model that's now in place; the lock byte layout
+  (RECOVERY at byte 2, WRITER at byte 0) is documented; tx style
+  table updated to show that pessimistic / auto-commit txns hold
+  the WRITER fcntl in addition to `db.mu`. Verified again at 8
+  processes × 200 inserts → 1600 docs preserved every time.
 - Multi-process foundation, phase 2C: fix the open-path race that
   was causing flaky `InvalidPageId` under 4+ concurrent first
   openers. Root cause: every fresh-init candidate (file_len == 0)
