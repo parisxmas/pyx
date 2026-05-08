@@ -1,4 +1,6 @@
-# pyx
+<p align="center">
+  <img src="assets/pyx-logo-transparent.png" alt="pyx — embedded document DB" width="640">
+</p>
 
 An embeddable document database engine written in Zig. Single-file storage,
 ACID transactions, lock-free MVCC snapshots, persistent secondary indexes,
