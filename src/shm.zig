@@ -213,14 +213,14 @@ pub const Shm = struct {
 
     /// Seed every atomic counter from the values the on-disk DB header
     /// has at open time. Called by the first opener — phase 1 always
-    /// calls it (single-process); phase 1C will gate it on the
-    /// RECOVERY fcntl lock so only one process re-seeds across a
+    /// calls it (single-process); phase 1C gates it on the
+    /// WRITER fcntl lock so only one process re-seeds across a
     /// multi-opener run.
     ///
-    /// Phase 2A: slot 0 of the collections array is also seeded — it
-    /// mirrors the top-level btree_root/free_head and represents the
-    /// default collection. Other slots stay zero/unused until phase 2B
-    /// starts populating them.
+    /// Phase 2B: every collection slot is seeded from the on-disk
+    /// header's `collection_roots[]` array. Slots that the header
+    /// reports as 0 stay zero (no tree yet); slot 0 is also marked
+    /// in-use so the default tree always has a valid slot.
     pub fn seedFromHeader(
         self: *Shm,
         next_doc_id: u64,
@@ -228,15 +228,29 @@ pub const Shm = struct {
         next_lsn: u64,
         btree_root: u64,
         free_head: u64,
+        collection_roots: []const u32,
     ) void {
+        std.debug.assert(collection_roots.len == max_collections);
         self.nextDocId().store(next_doc_id, .release);
         self.numPages().store(num_pages, .release);
         self.nextLsn().store(next_lsn, .release);
         self.btreeRoot().store(btree_root, .release);
         self.freeHead().store(free_head, .release);
-        self.collectionRoot(0).store(@intCast(btree_root), .release);
+        var i: usize = 0;
+        while (i < max_collections) : (i += 1) {
+            self.collectionRoot(i).store(collection_roots[i], .release);
+        }
+        // Slot 0 also mirrors the top-level free_head; non-default
+        // slots' free lists are reserved for phase 3+.
         self.collectionFreeHead(0).store(@intCast(free_head), .release);
         self.setCollectionInUse(0, true);
+        // Mark every other slot in_use if its root is non-zero —
+        // the on-disk header is the source of truth for which
+        // collections actually exist after a crash that lost shm.
+        i = 1;
+        while (i < max_collections) : (i += 1) {
+            if (collection_roots[i] != 0) self.setCollectionInUse(i, true);
+        }
         // wal_end_offset is owned by Wal — set when the WAL is opened.
     }
 };
@@ -264,7 +278,7 @@ test "shm: open creates fresh header; reopen validates" {
     }
 }
 
-test "shm: seedFromHeader marks slot 0 in_use and mirrors root/free_head" {
+test "shm: seedFromHeader fans collection_roots out across every slot" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
@@ -272,18 +286,20 @@ test "shm: seedFromHeader marks slot 0 in_use and mirrors root/free_head" {
     var shm = try Shm.open(io, tmp.dir, "slots.shm");
     defer shm.close();
 
-    // Before seed: slot 0 not yet in_use, every higher slot likewise.
     try testing.expect(!shm.collectionInUse(0));
     try testing.expect(!shm.collectionInUse(7));
 
-    shm.seedFromHeader(1, 1, 1, 0xABC, 0xDEF);
+    var roots = [_]u32{0} ** max_collections;
+    roots[0] = 0xABC;
+    roots[5] = 0x500;
+    shm.seedFromHeader(1, 1, 1, 0xABC, 0xDEF, &roots);
+
     try testing.expect(shm.collectionInUse(0));
+    try testing.expect(shm.collectionInUse(5)); // populated by header → in_use
+    try testing.expect(!shm.collectionInUse(1)); // empty → still unused
     try testing.expectEqual(@as(u32, 0xABC), shm.collectionRoot(0).load(.acquire));
+    try testing.expectEqual(@as(u32, 0x500), shm.collectionRoot(5).load(.acquire));
     try testing.expectEqual(@as(u32, 0xDEF), shm.collectionFreeHead(0).load(.acquire));
-    // Higher slots untouched — phase 2A only seeds the default.
-    try testing.expect(!shm.collectionInUse(1));
-    try testing.expect(!shm.collectionInUse(max_collections - 1));
-    try testing.expectEqual(@as(u32, 0), shm.collectionRoot(1).load(.acquire));
 }
 
 test "shm: rejects file with bad magic" {

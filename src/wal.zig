@@ -17,12 +17,19 @@
 //!     u32  crc32 (over type..body)
 //!
 //! Bodies:
-//!   PUT    (1):  varint key_len | key | varint value_len | value
-//!   DELETE (2):  varint key_len | key
-//!   COMMIT (3):  u64  next_doc_id   (state to restore after replaying the txn)
+//!   PUT      (1):  varint key_len | key | varint value_len | value
+//!                  (legacy v1; collection_id implied to be 0)
+//!   DELETE   (2):  varint key_len | key
+//!                  (legacy v1; collection_id implied to be 0)
+//!   COMMIT   (3):  u64  next_doc_id   (state to restore after replaying the txn)
+//!   PUT_V2   (4):  varint collection_id | varint key_len | key |
+//!                  varint value_len | value
+//!   DELETE_V2(5):  varint collection_id | varint key_len | key
 //!
-//! A transaction is one or more PUT/DELETE records followed by one COMMIT.
-//! Records past the last good COMMIT are discarded on replay (truncated).
+//! A transaction is one or more PUT*/DELETE* records followed by one
+//! COMMIT. Records past the last good COMMIT are discarded on replay
+//! (truncated). New writes always emit V2 records; replay accepts both
+//! V1 and V2 so v0.3.0 WALs still apply cleanly under v0.4.0 code.
 
 const std = @import("std");
 const Io = std.Io;
@@ -45,6 +52,8 @@ pub const RecordType = enum(u8) {
     put = 1,
     delete = 2,
     commit = 3,
+    put_v2 = 4,
+    delete_v2 = 5,
     _,
 };
 
@@ -56,8 +65,8 @@ pub const Error = error{
 };
 
 pub const Record = union(enum) {
-    put: struct { key: []const u8, value: []const u8 },
-    delete: []const u8,
+    put: struct { collection_id: u32, key: []const u8, value: []const u8 },
+    delete: struct { collection_id: u32, key: []const u8 },
     commit: struct { next_doc_id: u64 },
 };
 
@@ -218,21 +227,24 @@ pub const Wal = struct {
     pub fn appendPut(
         self: *Wal,
         lsn: u64,
+        collection_id: u32,
         key: []const u8,
         value: []const u8,
     ) !void {
+        const cid_size = doc_mod.varintSize(collection_id);
         const klen_size = doc_mod.varintSize(key.len);
         const vlen_size = doc_mod.varintSize(value.len);
-        const body_len = klen_size + key.len + vlen_size + value.len;
+        const body_len = cid_size + klen_size + key.len + vlen_size + value.len;
         const total = record_header_size + body_len + 4;
         try self.pending.ensureUnusedCapacity(self.allocator, total);
         const start = self.pending.items.len;
         self.pending.items.len += total;
         const slot = self.pending.items[start..][0..total];
-        slot[0] = @intFromEnum(RecordType.put);
+        slot[0] = @intFromEnum(RecordType.put_v2);
         mem.writeInt(u64, slot[1..9], lsn, .little);
         mem.writeInt(u32, slot[9..13], @intCast(body_len), .little);
         var p: usize = record_header_size;
+        p += doc_mod.writeVarint(slot[p..], collection_id);
         p += doc_mod.writeVarint(slot[p..], key.len);
         @memcpy(slot[p .. p + key.len], key);
         p += key.len;
@@ -242,17 +254,19 @@ pub const Wal = struct {
         mem.writeInt(u32, slot[record_header_size + body_len ..][0..4], csum, .little);
     }
 
-    pub fn appendDelete(self: *Wal, lsn: u64, key: []const u8) !void {
+    pub fn appendDelete(self: *Wal, lsn: u64, collection_id: u32, key: []const u8) !void {
+        const cid_size = doc_mod.varintSize(collection_id);
         const klen_size = doc_mod.varintSize(key.len);
-        const body_len = klen_size + key.len;
-        var body_buf: [16]u8 = undefined;
+        const body_len = cid_size + klen_size + key.len;
+        var body_buf: [32]u8 = undefined;
         const stack_ok = body_len <= body_buf.len;
         const body = if (stack_ok) body_buf[0..body_len] else try self.allocator.alloc(u8, body_len);
         defer if (!stack_ok) self.allocator.free(body);
         var p: usize = 0;
+        p += doc_mod.writeVarint(body[p..], collection_id);
         p += doc_mod.writeVarint(body[p..], key.len);
         @memcpy(body[p .. p + key.len], key);
-        try self.stage(.delete, lsn, body);
+        try self.stage(.delete_v2, lsn, body);
     }
 
     pub fn appendCommit(self: *Wal, lsn: u64, next_doc_id: u64) !void {
@@ -433,11 +447,27 @@ pub const Wal = struct {
                     const after_key = body[k.len + k.value ..];
                     const vlen = try readVarint(after_key);
                     const value = after_key[vlen.len .. vlen.len + vlen.value];
-                    break :blk .{ .put = .{ .key = key, .value = value } };
+                    break :blk .{ .put = .{ .collection_id = 0, .key = key, .value = value } };
                 },
                 .delete => blk: {
                     const k = try readVarint(body);
-                    break :blk .{ .delete = body[k.len .. k.len + k.value] };
+                    break :blk .{ .delete = .{ .collection_id = 0, .key = body[k.len .. k.len + k.value] } };
+                },
+                .put_v2 => blk: {
+                    const cid = try readVarint(body);
+                    const after_cid = body[cid.len..];
+                    const k = try readVarint(after_cid);
+                    const key = after_cid[k.len .. k.len + k.value];
+                    const after_key = after_cid[k.len + k.value ..];
+                    const vlen = try readVarint(after_key);
+                    const value = after_key[vlen.len .. vlen.len + vlen.value];
+                    break :blk .{ .put = .{ .collection_id = @intCast(cid.value), .key = key, .value = value } };
+                },
+                .delete_v2 => blk: {
+                    const cid = try readVarint(body);
+                    const after_cid = body[cid.len..];
+                    const k = try readVarint(after_cid);
+                    break :blk .{ .delete = .{ .collection_id = @intCast(cid.value), .key = after_cid[k.len .. k.len + k.value] } };
                 },
                 .commit => .{ .commit = .{ .next_doc_id = mem.readInt(u64, body[0..8], .little) } },
                 _ => return max_lsn,
@@ -504,10 +534,10 @@ test "logical wal append + replay applies committed records only" {
     var w = try Wal.open(ally, io, tmp.dir, "wal", &stub_end_offset);
     defer w.close();
 
-    try w.appendPut(1, "alpha", "A");
-    try w.appendPut(2, "beta", "B");
+    try w.appendPut(1, 0, "alpha", "A");
+    try w.appendPut(2, 0, "beta", "B");
     try w.appendCommit(3, 42);
-    try w.appendPut(4, "gamma", "G");
+    try w.appendPut(4, 0, "gamma", "G");
     try w.sync();
 
     const Captured = struct {
@@ -561,7 +591,7 @@ test "wal reset truncates back to header" {
     var w = try Wal.open(ally, io, tmp.dir, "wal", &stub_end_offset);
     defer w.close();
 
-    try w.appendPut(1, "k", "v");
+    try w.appendPut(1, 0, "k", "v");
     try w.appendCommit(2, 1);
     try w.reset();
     try testing.expectEqual(@as(u64, wal_header_size), w.end_offset);

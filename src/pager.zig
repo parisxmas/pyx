@@ -55,7 +55,13 @@ pub const default_collection_id: CollectionId = 0;
 pub const max_collections: usize = 16;
 
 const magic: [8]u8 = .{ 'P', 'Y', 'X', 'D', 'B', '0', '0', '1' };
-const format_version: u32 = 1;
+/// On-disk header format version. v1: single `btree_root` field.
+/// v2 (sharding phase 2B): adds a `collection_roots[max_collections]`
+/// array so each collection's tree root can be persisted independently
+/// of the default tree's. v2 readers can deserialize v1 files (the
+/// extra slots are inferred to be empty); v1 readers cannot read v2
+/// files (the CRC region grew).
+const format_version: u32 = 2;
 
 pub const Header = struct {
     version: u32 = format_version,
@@ -63,7 +69,14 @@ pub const Header = struct {
     num_pages: u64 = 1,
     free_head: PageId = 0,
     next_doc_id: u64 = 1,
+    /// Mirrors `collection_roots[default_collection_id]`. Kept as a
+    /// dedicated field for the (many) call sites that just want
+    /// "the" root and shouldn't have to know about sharding.
     btree_root: PageId = 0,
+    /// Live B+Tree root for each collection slot. Slot 0 is the
+    /// default collection (mirrored to `btree_root`); higher slots
+    /// are 0 until phase 2C wires up `createCollection`.
+    collection_roots: [max_collections]PageId = [_]PageId{0} ** max_collections,
 };
 
 pub const Error = error{
@@ -82,7 +95,7 @@ fn serializeHeader(h: Header, buf: *[page_size]u8) void {
     @memset(buf, 0);
     @memcpy(buf[0..8], &magic);
     var i: usize = 8;
-    mem.writeInt(u32, buf[i..][0..4], h.version, .little);
+    mem.writeInt(u32, buf[i..][0..4], format_version, .little);
     i += 4;
     mem.writeInt(u32, buf[i..][0..4], h.page_size, .little);
     i += 4;
@@ -94,6 +107,11 @@ fn serializeHeader(h: Header, buf: *[page_size]u8) void {
     i += 8;
     mem.writeInt(u32, buf[i..][0..4], h.btree_root, .little);
     i += 4;
+    var slot: usize = 0;
+    while (slot < max_collections) : (slot += 1) {
+        mem.writeInt(u32, buf[i..][0..4], h.collection_roots[slot], .little);
+        i += 4;
+    }
     const csum = Crc32.hash(buf[0..i]);
     mem.writeInt(u32, buf[i..][0..4], csum, .little);
 }
@@ -103,7 +121,7 @@ fn deserializeHeader(buf: *const [page_size]u8) Error!Header {
     var i: usize = 8;
     const version = mem.readInt(u32, buf[i..][0..4], .little);
     i += 4;
-    if (version != format_version) return Error.UnsupportedVersion;
+    if (version != 1 and version != 2) return Error.UnsupportedVersion;
     const ps = mem.readInt(u32, buf[i..][0..4], .little);
     i += 4;
     if (ps != page_size) return Error.WrongPageSize;
@@ -115,6 +133,18 @@ fn deserializeHeader(buf: *const [page_size]u8) Error!Header {
     i += 8;
     const btree_root = mem.readInt(u32, buf[i..][0..4], .little);
     i += 4;
+    var collection_roots: [max_collections]PageId = [_]PageId{0} ** max_collections;
+    if (version == 2) {
+        var slot: usize = 0;
+        while (slot < max_collections) : (slot += 1) {
+            collection_roots[slot] = mem.readInt(u32, buf[i..][0..4], .little);
+            i += 4;
+        }
+    } else {
+        // v1 file: only the default tree's root was persisted. Higher
+        // slots stay zero (no other collections existed in v1).
+        collection_roots[default_collection_id] = btree_root;
+    }
     const stored = mem.readInt(u32, buf[i..][0..4], .little);
     if (stored != Crc32.hash(buf[0..i])) return Error.CorruptHeader;
     return .{
@@ -124,6 +154,7 @@ fn deserializeHeader(buf: *const [page_size]u8) Error!Header {
         .free_head = free_head,
         .next_doc_id = next_doc_id,
         .btree_root = btree_root,
+        .collection_roots = collection_roots,
     };
 }
 
@@ -142,9 +173,14 @@ pub const SyncMode = enum {
 /// Per-record key/value bytes are allocated from the pager's per-txn arena;
 /// they're freed in bulk by `txn_arena.reset(.retain_capacity)` at commit
 /// or abort, so this union has no `deinit`.
+///
+/// Each record carries the `CollectionId` of the tree it should be
+/// applied to (sharding phase 2B). For the default tree (id 0) the WAL
+/// still emits the legacy V1 record types so v0.3.0 readers can scan
+/// pre-2B WAL files; non-default ids force the V2 record format.
 pub const PendingRecord = union(enum) {
-    put: struct { key: []const u8, value: []const u8 },
-    delete: []const u8,
+    put: struct { collection_id: CollectionId, key: []const u8, value: []const u8 },
+    delete: struct { collection_id: CollectionId, key: []const u8 },
 };
 
 pub const Pager = struct {
@@ -254,6 +290,7 @@ pub const Pager = struct {
                 1, // next_lsn placeholder; replay's restoreNextLsn updates
                 @intCast(header.btree_root),
                 @intCast(header.free_head),
+                &header.collection_roots,
             );
         } else if (!shm.collectionInUse(default_collection_id)) {
             // Legacy shm from a pre-sharding pyx: the top-level fields
@@ -425,6 +462,14 @@ pub const Pager = struct {
         self.header.num_pages = self.shm.numPages().load(.acquire);
         self.header.next_doc_id = self.shm.nextDocId().load(.acquire);
         self.header.free_head = @intCast(self.shm.freeHead().load(.acquire));
+        // Per-collection roots also flow through shm (sharding phase 2B).
+        var slot: usize = 0;
+        while (slot < max_collections) : (slot += 1) {
+            self.header.collection_roots[slot] = @intCast(self.shm.collectionRoot(slot).load(.acquire));
+        }
+        // Keep the legacy `btree_root` field consistent with slot 0
+        // for callers that still read it directly.
+        self.header.btree_root = self.header.collection_roots[default_collection_id];
 
         // Capture the live page count for abort rollback.
         self.txn_header_snapshot = self.header;
@@ -499,8 +544,8 @@ pub const Pager = struct {
         for (self.pending.items) |rec| {
             const lsn = lsn_counter.fetchAdd(1, .monotonic);
             switch (rec) {
-                .put => |p| try self.wal.appendPut(lsn, p.key, p.value),
-                .delete => |k| try self.wal.appendDelete(lsn, k),
+                .put => |p| try self.wal.appendPut(lsn, p.collection_id, p.key, p.value),
+                .delete => |d| try self.wal.appendDelete(lsn, d.collection_id, d.key),
             }
         }
         const commit_lsn = lsn_counter.fetchAdd(1, .monotonic);
@@ -564,6 +609,16 @@ pub const Pager = struct {
         // them against the file safely.
         self.shm.freeHead().store(@intCast(self.header.free_head), .release);
         self.shm.btreeRoot().store(@intCast(self.header.btree_root), .release);
+        // Sharding phase 2B: publish per-collection roots. Slots that
+        // weren't touched still hold their previous value — writing
+        // the same value back is harmless. Order: shm.btreeRoot then
+        // collectionRoot[0] keep matching values; in this same write
+        // wave the kernel page cache also reflects every dirty page
+        // we just pwrote.
+        var slot: usize = 0;
+        while (slot < max_collections) : (slot += 1) {
+            self.shm.collectionRoot(slot).store(@intCast(self.header.collection_roots[slot]), .release);
+        }
 
         self.pending.clearRetainingCapacity();
         _ = self.txn_arena.reset(.retain_capacity);
@@ -593,21 +648,34 @@ pub const Pager = struct {
         }
     }
 
-    pub fn recordPut(self: *Pager, key: []const u8, value: []const u8) !void {
+    pub fn recordPut(
+        self: *Pager,
+        collection_id: CollectionId,
+        key: []const u8,
+        value: []const u8,
+    ) !void {
         if (self.in_recovery or !self.in_txn) return;
+        std.debug.assert(collection_id < max_collections);
         const arena = self.txn_arena.allocator();
         try self.pending.append(self.allocator, .{
             .put = .{
+                .collection_id = collection_id,
                 .key = try arena.dupe(u8, key),
                 .value = try arena.dupe(u8, value),
             },
         });
     }
 
-    pub fn recordDelete(self: *Pager, key: []const u8) !void {
+    pub fn recordDelete(self: *Pager, collection_id: CollectionId, key: []const u8) !void {
         if (self.in_recovery or !self.in_txn) return;
+        std.debug.assert(collection_id < max_collections);
         const arena = self.txn_arena.allocator();
-        try self.pending.append(self.allocator, .{ .delete = try arena.dupe(u8, key) });
+        try self.pending.append(self.allocator, .{
+            .delete = .{
+                .collection_id = collection_id,
+                .key = try arena.dupe(u8, key),
+            },
+        });
     }
 
     fn clearDirty(self: *Pager) void {
@@ -764,25 +832,23 @@ pub const Pager = struct {
     }
 
     pub fn setBTreeRoot(self: *Pager, collection_id: CollectionId, new_root: PageId) !void {
-        // Phase 1 of keyspace sharding: only the default collection
-        // exists. The id parameter is plumbed through every call site
-        // so phase 2's per-collection catalog can land without API
-        // changes; for now `header.btree_root` is the single source of
-        // truth and any non-default id is a programming error.
-        std.debug.assert(collection_id == default_collection_id);
-        if (self.header.btree_root == new_root) return; // no-op if unchanged
+        std.debug.assert(collection_id < max_collections);
+        const cur = self.header.collection_roots[collection_id];
+        if (cur == new_root) return; // no-op if unchanged
         if (self.in_txn) {
             // Update only the in-process header during the txn — shm
             // is updated atomically at applyAndFinalize, AFTER all
             // dirty pages are on disk, so other processes never see a
             // root pointing at pages the file doesn't have yet.
-            self.header.btree_root = new_root;
+            self.header.collection_roots[collection_id] = new_root;
+            if (collection_id == default_collection_id) self.header.btree_root = new_root;
             self.header_dirty = true;
             return;
         }
         try self.begin();
         errdefer self.abort();
-        self.header.btree_root = new_root;
+        self.header.collection_roots[collection_id] = new_root;
+        if (collection_id == default_collection_id) self.header.btree_root = new_root;
         self.header_dirty = true;
         try self.commit();
     }
@@ -793,9 +859,9 @@ pub const Pager = struct {
     /// must walk. Outside a txn, it's the shm-resident value, so any
     /// process that has the DB open sees the latest committed root.
     pub fn bTreeRoot(self: *Pager, collection_id: CollectionId) PageId {
-        std.debug.assert(collection_id == default_collection_id);
-        if (self.in_txn) return self.header.btree_root;
-        return @intCast(self.shm.btreeRoot().load(.acquire));
+        std.debug.assert(collection_id < max_collections);
+        if (self.in_txn) return self.header.collection_roots[collection_id];
+        return @intCast(self.shm.collectionRoot(collection_id).load(.acquire));
     }
 
     /// Whether `id` was allocated/modified earlier in the current

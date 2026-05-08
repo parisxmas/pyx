@@ -72,8 +72,8 @@ fn validateName(name: []const u8) !void {
 }
 
 const ReplayOp = union(enum) {
-    put: struct { key: []u8, value: []u8 },
-    delete: []u8,
+    put: struct { collection_id: pager_mod.CollectionId, key: []u8, value: []u8 },
+    delete: struct { collection_id: pager_mod.CollectionId, key: []u8 },
 
     fn deinit(self: ReplayOp, allocator: Allocator) void {
         switch (self) {
@@ -81,7 +81,7 @@ const ReplayOp = union(enum) {
                 allocator.free(p.key);
                 allocator.free(p.value);
             },
-            .delete => |k| allocator.free(k),
+            .delete => |d| allocator.free(d.key),
         }
     }
 };
@@ -96,17 +96,28 @@ const ReplayCtx = struct {
         switch (rec) {
             .put => |p| try self.pending.append(self.allocator, .{
                 .put = .{
+                    .collection_id = p.collection_id,
                     .key = try self.allocator.dupe(u8, p.key),
                     .value = try self.allocator.dupe(u8, p.value),
                 },
             }),
-            .delete => |k| try self.pending.append(self.allocator, .{ .delete = try self.allocator.dupe(u8, k) }),
+            .delete => |d| try self.pending.append(self.allocator, .{
+                .delete = .{
+                    .collection_id = d.collection_id,
+                    .key = try self.allocator.dupe(u8, d.key),
+                },
+            }),
             .commit => |c| {
-                const bt = btree_mod.BTree.init(self.allocator, self.pager, pager_mod.default_collection_id);
                 for (self.pending.items) |op| {
                     switch (op) {
-                        .put => |p| try bt.put(p.key, p.value),
-                        .delete => |k| _ = try bt.delete(k),
+                        .put => |p| {
+                            const bt = btree_mod.BTree.init(self.allocator, self.pager, p.collection_id);
+                            try bt.put(p.key, p.value);
+                        },
+                        .delete => |d| {
+                            const bt = btree_mod.BTree.init(self.allocator, self.pager, d.collection_id);
+                            _ = try bt.delete(d.key);
+                        },
                     }
                 }
                 self.pager.restoreNextDocId(c.next_doc_id);

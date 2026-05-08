@@ -576,12 +576,12 @@ pub const BTree = struct {
         if (key.len == 0 or key.len > max_key_size) return Error.KeyTooLarge;
         if (value.len > max_value_size) return Error.ValueTooLarge;
         if (self.pager.in_txn) {
-            try self.pager.recordPut(key, value);
+            try self.pager.recordPut(self.collection_id, key, value);
             return self.putTxn(key, value);
         }
         try self.pager.begin();
         errdefer self.pager.abort();
-        try self.pager.recordPut(key, value);
+        try self.pager.recordPut(self.collection_id, key, value);
         try self.putTxn(key, value);
         try self.pager.commit();
     }
@@ -976,12 +976,12 @@ pub const BTree = struct {
 
     pub fn delete(self: BTree, key: []const u8) !bool {
         if (self.pager.in_txn) {
-            try self.pager.recordDelete(key);
+            try self.pager.recordDelete(self.collection_id, key);
             return self.deleteTxn(key);
         }
         try self.pager.begin();
         errdefer self.pager.abort();
-        try self.pager.recordDelete(key);
+        try self.pager.recordDelete(self.collection_id, key);
         const found = try self.deleteTxn(key);
         try self.pager.commit();
         return found;
@@ -1424,4 +1424,73 @@ test "snapshot iterator unaffected by concurrent writes" {
     // pre-mutation entries.
     while (try snap_iter.next()) |_| seen += 1;
     try testing.expectEqual(@as(u32, 50), seen);
+}
+
+
+test "sharding 2B: trees rooted at different CollectionIds are isolated" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var p = try openTestPager(&tmp);
+    defer p.close();
+
+    const bt0 = BTree.init(testing.allocator, &p, 0);
+    const bt1 = BTree.init(testing.allocator, &p, 1);
+
+    try bt0.put("alpha", "in-0");
+    try bt1.put("alpha", "in-1");
+    try bt0.put("only-0", "v");
+    try bt1.put("only-1", "v");
+
+    // Each tree's view of "alpha" is its own value.
+    const a0 = (try bt0.get(testing.allocator, "alpha")).?;
+    defer testing.allocator.free(a0);
+    const a1 = (try bt1.get(testing.allocator, "alpha")).?;
+    defer testing.allocator.free(a1);
+    try testing.expectEqualStrings("in-0", a0);
+    try testing.expectEqualStrings("in-1", a1);
+
+    // Cross-collection key lookups miss.
+    try testing.expect(try bt0.get(testing.allocator, "only-1") == null);
+    try testing.expect(try bt1.get(testing.allocator, "only-0") == null);
+
+    // Roots are different page ids.
+    try testing.expect(p.bTreeRoot(0) != p.bTreeRoot(1));
+}
+
+test "sharding 2B: per-collection roots survive close/reopen + lost shm" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var p = try openTestPager(&tmp);
+        defer p.close();
+        const bt0 = BTree.init(testing.allocator, &p, 0);
+        const bt5 = BTree.init(testing.allocator, &p, 5);
+        try bt0.put("default-key", "default-val");
+        try bt5.put("shard-5-key", "shard-5-val");
+        try p.checkpoint();
+    }
+    // Simulate machine reboot: shm + WAL are gone, only the data file
+    // is on disk. The reopen path must reconstruct shm slots from the
+    // header v2's collection_roots[].
+    tmp.dir.deleteFile(testing.io, "btree.db.wal") catch {};
+    tmp.dir.deleteFile(testing.io, "btree.db-shm") catch {};
+
+    var p = try openTestPager(&tmp);
+    defer p.close();
+
+    // Both trees come back with the right contents — proving header v2's
+    // collection_roots[] array round-tripped through serialize/deserialize
+    // and the WAL replay (if any) dispatched to the right tree.
+    const bt0 = BTree.init(testing.allocator, &p, 0);
+    const bt5 = BTree.init(testing.allocator, &p, 5);
+    const v0 = (try bt0.get(testing.allocator, "default-key")).?;
+    defer testing.allocator.free(v0);
+    const v5 = (try bt5.get(testing.allocator, "shard-5-key")).?;
+    defer testing.allocator.free(v5);
+    try testing.expectEqualStrings("default-val", v0);
+    try testing.expectEqualStrings("shard-5-val", v5);
+
+    // Cross-tree checks.
+    try testing.expect(try bt0.get(testing.allocator, "shard-5-key") == null);
+    try testing.expect(try bt5.get(testing.allocator, "default-key") == null);
 }

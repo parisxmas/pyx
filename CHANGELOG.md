@@ -8,6 +8,52 @@ tag goes under `## Unreleased`.
 ## Unreleased
 
 ### Added
+- Keyspace sharding, phase 2B: actual per-collection tree routing,
+  end to end. No public API yet — `Db.collection(name)` still
+  resolves every name to the default tree — but every layer below
+  it now respects the `CollectionId` plumbed through phase 1, and
+  per-collection trees are correctly persisted, replayed, and
+  reseeded into a fresh shm.
+  - **Disk format bumps to version 2.** Header gains a
+    `collection_roots[max_collections]` array (64 bytes) so each
+    tree's root rides through close/reopen without depending on
+    shm. v1 files still open: the deserializer detects
+    `version == 1`, infers `collection_roots[0] = btree_root`,
+    and leaves higher slots zero. v2 writes always go through
+    new code; v0.3.0 binaries can no longer open v2 files.
+  - **WAL gets V2 record types.** `put_v2 (4)` and
+    `delete_v2 (5)` carry a `varint collection_id` prefix in the
+    body; legacy `put (1)` / `delete (2)` records are still
+    parsed during replay (implicit collection_id = 0). All new
+    writes emit V2 records; the recovery path dispatches each
+    op to `BTree.init(allocator, pager, p.collection_id)`.
+  - **`Pager.bTreeRoot(id)` / `Pager.setBTreeRoot(id, root)`**
+    actually route per-id. In-txn reads/writes go through the
+    in-process `header.collection_roots[id]` array;
+    out-of-txn reads return `shm.collectionRoot(id)`.
+    `Pager.recordPut` and `Pager.recordDelete` now take a
+    `CollectionId`; `BTree` forwards its own `self.collection_id`
+    on every call.
+  - **`pager.begin` refreshes all per-id roots from shm** under
+    the WRITER lock; `applyAndFinalize` publishes every slot
+    back. `shm.seedFromHeader` takes the full
+    `collection_roots[]` slice and fans it out across slots,
+    and marks any slot with a non-zero on-disk root as in-use —
+    so a process whose shm got wiped (machine reboot) can
+    recover the live state purely from the data file's header.
+  - Two new sharding tests in `src/btree.zig` exercise the new
+    routing without going through the still-default `Db` API:
+    one verifies key isolation across `BTree.init(..., id=0)`
+    vs `BTree.init(..., id=5)`; another simulates a reboot by
+    deleting `-shm` + `.wal` between sessions and confirms
+    both trees come back with the right contents purely from
+    the on-disk header.
+  - 92/92 tests pass; Python binding round-trip still clean.
+    Phase 2C will wire up the public-facing
+    `Db.createCollection` API + on-disk name→id catalog +
+    snapshot/index updates that depend on knowing which id a
+    given collection name belongs to.
+
 - Keyspace sharding, phase 2A: `shm.zig` reserves a 16-slot
   `collections[]` array (256 bytes after the existing fields, well
   inside the 4 KB `-shm` reservation). Each slot carries a
