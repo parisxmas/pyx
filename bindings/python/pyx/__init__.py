@@ -108,6 +108,18 @@ def _to_bound(v: Union[None, "Bound", "ScalarValue"], pins: list) -> Optional[_f
     return b
 
 
+def _build_field_arrays(fields):
+    """Build the (char**, size_t*) array pair for the compound-index C
+    ABI. Returns the ctypes objects; both must outlive the C call. Each
+    field is encoded as UTF-8 and stored in a list pinned by the
+    returned ctypes arrays so the bytes survive."""
+    n = len(fields)
+    encoded = [f.encode("utf-8") for f in fields]
+    ptr_arr = (C.c_char_p * n)(*encoded)
+    len_arr = (C.c_size_t * n)(*[len(b) for b in encoded])
+    return ptr_arr, len_arr
+
+
 def _bounds_from_kwargs(
     gte=None, gt=None, lte=None, lt=None,
 ) -> tuple[Optional["Bound"], Optional["Bound"]]:
@@ -213,13 +225,37 @@ class Db:
         _check(_ffi.pyx_snapshot_open(self._handle, C.byref(out)))
         return Snapshot(self, out)
 
-    def create_index(self, collection: str, field: str) -> None:
-        cb, fb = _utf8(collection), _utf8(field)
-        _check(_ffi.pyx_create_index(self._handle, cb, len(cb), fb, len(fb)))
+    def create_index(self, collection: str, *fields: str) -> None:
+        """Create a secondary index. Pass one field name for a single-
+        field index or two-or-more for a compound index:
 
-    def drop_index(self, collection: str, field: str) -> None:
-        cb, fb = _utf8(collection), _utf8(field)
-        _check(_ffi.pyx_drop_index(self._handle, cb, len(cb), fb, len(fb)))
+            db.create_index("users", "name")                  # single
+            db.create_index("users", "last", "first")         # compound
+        """
+        if not fields:
+            raise TypeError("create_index needs at least one field name")
+        cb = _utf8(collection)
+        if len(fields) == 1:
+            fb = _utf8(fields[0])
+            _check(_ffi.pyx_create_index(self._handle, cb, len(cb), fb, len(fb)))
+            return
+        ptrs, lens = _build_field_arrays(fields)
+        _check(_ffi.pyx_create_compound_index(
+            self._handle, cb, len(cb), ptrs, lens, len(fields),
+        ))
+
+    def drop_index(self, collection: str, *fields: str) -> None:
+        if not fields:
+            raise TypeError("drop_index needs at least one field name")
+        cb = _utf8(collection)
+        if len(fields) == 1:
+            fb = _utf8(fields[0])
+            _check(_ffi.pyx_drop_index(self._handle, cb, len(cb), fb, len(fb)))
+            return
+        ptrs, lens = _build_field_arrays(fields)
+        _check(_ffi.pyx_drop_compound_index(
+            self._handle, cb, len(cb), ptrs, lens, len(fields),
+        ))
 
     def begin_optimistic(self) -> "OptimisticTxn":
         """Open an optimistic-concurrency transaction.
@@ -361,7 +397,25 @@ class Collection:
         finally:
             _ffi.pyx_iter_close(h)
 
-    def find_one(self, field: str, value: ScalarValue) -> Optional[int]:
+    def find_one(self, field=None, value=None, /, **kwargs) -> Optional[int]:
+        """Indexed equality lookup. Two calling styles:
+
+            users.find_one("name", "alice")                       # single-field
+            users.find_one(last="smith", first="alice")           # compound
+
+        Compound queries use kwargs in insertion order; the kwargs key
+        sequence must match the field order of an existing compound
+        index. Mixing positional and kwargs is an error.
+        """
+        if field is not None and kwargs:
+            raise TypeError("find_one: pass either (field, value) or **kwargs, not both")
+        if field is not None:
+            return self._find_one_single(field, value)
+        if kwargs:
+            return self._find_one_compound(list(kwargs.keys()), list(kwargs.values()))
+        raise TypeError("find_one needs (field, value) or **kwargs")
+
+    def _find_one_single(self, field: str, value: ScalarValue) -> Optional[int]:
         pins: list = []
         v = _to_pyx_value(value, pins)
         out = C.c_uint64()
@@ -369,6 +423,26 @@ class Collection:
         rc = _ffi.pyx_find_one(
             self._db._handle, self._name_bytes, len(self._name_bytes),
             cb, len(cb), C.byref(v), C.byref(out),
+        )
+        del pins
+        if rc == _ffi.PYX_NOT_FOUND:
+            return None
+        _check(rc)
+        return int(out.value)
+
+    def _find_one_compound(self, fields, values) -> Optional[int]:
+        if not fields:
+            raise TypeError("find_one needs at least one field")
+        n = len(fields)
+        ptrs, lens = _build_field_arrays(fields)
+        pins: list = []
+        val_arr = (_ffi.PyxValue * n)()
+        for i, v in enumerate(values):
+            val_arr[i] = _to_pyx_value(v, pins)
+        out = C.c_uint64()
+        rc = _ffi.pyx_compound_find_one(
+            self._db._handle, self._name_bytes, len(self._name_bytes),
+            ptrs, lens, n, val_arr, C.byref(out),
         )
         del pins
         if rc == _ffi.PYX_NOT_FOUND:

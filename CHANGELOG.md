@@ -15,8 +15,18 @@ tag goes under `## Unreleased`.
   on insert / put / delete; persisted in two new namespaces (\x03 for
   the registry, \x04 for entries) so existing single-field indexes are
   unaffected. v1 limits: equality-only, no range on the trailing
-  field, max 16 fields per index. C ABI + Python bindings + OCC
-  range-set tracking land in phases 2 and 3.
+  field, max 16 fields per index.
+- Compound indexes (phase 2 — bindings):
+  - C ABI: `pyx_create_compound_index`, `pyx_drop_compound_index`,
+    `pyx_compound_find_one`. Field lists are passed as a `(char**,
+    size_t*, n_fields)` triple, mirroring Zig's `[]const []const u8`.
+  - Python: `Db.create_index(coll, *fields)` is now variadic — pass 1
+    field for single, 2+ for compound. `Db.drop_index` matches.
+    `Collection.find_one(**kwargs)` resolves to the compound index
+    whose ordered fields match the kwarg keys; `find_one("field",
+    value)` still works for single-field. Mixing positional and
+    kwargs is a TypeError.
+  - 1 new C-ABI test, 5 new Python tests.
 - `Pager.flushForSnapshot` — soft-flush variant that pwrites the dirty
   page cache into the kernel page cache without fsync or WAL truncate.
   `Db.snapshot()` uses it instead of `checkpoint`, dropping snapshot

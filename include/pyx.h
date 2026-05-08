@@ -332,6 +332,46 @@ pyx_status pyx_snapshot_find_range(
     pyx_lookup **out_lookup);
 
 /* ===================================================================== */
+/*  Compound (multi-field) indexes                                        */
+/* ===================================================================== */
+
+/*  Compound indexes match an ordered tuple of fields. `(last, first)` is
+ *  a different index from `(first, last)` — the leftmost field comes
+ *  first and only the full prefix is queryable in this version.
+ *
+ *  `fields` is an array of `n_fields` UTF-8 byte pointers; `field_lens`
+ *  is the matching length array. `values` (for find_one) must align in
+ *  order with `fields`.
+ *
+ *  Coexists with single-field indexes — the two registries live in
+ *  separate namespaces, so you can have both kinds on the same field
+ *  set if you want.
+ */
+
+pyx_status pyx_create_compound_index(
+    pyx_db *db,
+    const char *coll, size_t coll_len,
+    const char *const *fields,
+    const size_t *field_lens,
+    size_t n_fields);
+
+pyx_status pyx_drop_compound_index(
+    pyx_db *db,
+    const char *coll, size_t coll_len,
+    const char *const *fields,
+    const size_t *field_lens,
+    size_t n_fields);
+
+pyx_status pyx_compound_find_one(
+    pyx_db *db,
+    const char *coll, size_t coll_len,
+    const char *const *fields,
+    const size_t *field_lens,
+    size_t n_fields,
+    const pyx_value *values,
+    uint64_t *out_doc_id);
+
+/* ===================================================================== */
 /*  Optimistic-concurrency transactions                                   */
 /* ===================================================================== */
 

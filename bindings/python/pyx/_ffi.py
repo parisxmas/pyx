@@ -290,3 +290,24 @@ pyx_optimistic_find_one = _bind(
     C.c_void_p, C.c_char_p, C.c_size_t, C.c_char_p, C.c_size_t,
     C.POINTER(PyxValue), C.POINTER(C.c_uint64),
 )
+
+# Compound indexes
+pyx_create_compound_index = _bind(
+    "pyx_create_compound_index",
+    C.c_int,
+    C.c_void_p, C.c_char_p, C.c_size_t,
+    C.POINTER(C.c_char_p), C.POINTER(C.c_size_t), C.c_size_t,
+)
+pyx_drop_compound_index = _bind(
+    "pyx_drop_compound_index",
+    C.c_int,
+    C.c_void_p, C.c_char_p, C.c_size_t,
+    C.POINTER(C.c_char_p), C.POINTER(C.c_size_t), C.c_size_t,
+)
+pyx_compound_find_one = _bind(
+    "pyx_compound_find_one",
+    C.c_int,
+    C.c_void_p, C.c_char_p, C.c_size_t,
+    C.POINTER(C.c_char_p), C.POINTER(C.c_size_t), C.c_size_t,
+    C.POINTER(PyxValue), C.POINTER(C.c_uint64),
+)

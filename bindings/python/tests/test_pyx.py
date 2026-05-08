@@ -371,3 +371,50 @@ class TestFindRangeErgonomics:
         db.create_index("users", "age")
         with pytest.raises(TypeError):
             list(users.find_range("age", gte=1, gt=2))
+
+
+class TestCompoundIndex:
+    def test_create_compound_and_find(self, db):
+        users = db.collection("users")
+        users.insert({"last": "smith", "first": "alice"})
+        users.insert({"last": "smith", "first": "bob"})
+        users.insert({"last": "jones", "first": "carol"})
+
+        db.create_index("users", "last", "first")
+
+        # kwargs style — order matches the index
+        got = users.find_one(last="smith", first="bob")
+        assert got is not None
+        assert users.get(got)["first"] == "bob"
+
+        # No matching tuple → None.
+        assert users.find_one(last="smith", first="dave") is None
+
+    def test_single_field_still_works(self, db):
+        users = db.collection("users")
+        uid = users.insert({"name": "alice"})
+        db.create_index("users", "name")
+        # Positional 2-arg, unchanged.
+        assert users.find_one("name", "alice") == uid
+
+    def test_wrong_field_order_raises(self, db):
+        users = db.collection("users")
+        users.insert({"last": "smith", "first": "alice"})
+        db.create_index("users", "last", "first")
+        # Querying with kwargs in the WRONG order → no such index.
+        with pytest.raises(pyx.PyxError):
+            users.find_one(first="alice", last="smith")
+
+    def test_mixed_positional_and_kwargs_rejected(self, db):
+        users = db.collection("users")
+        with pytest.raises(TypeError):
+            users.find_one("name", "alice", first="bob")
+
+    def test_compound_drop(self, db):
+        users = db.collection("users")
+        users.insert({"a": 1, "b": 2})
+        db.create_index("users", "a", "b")
+        assert users.find_one(a=1, b=2) is not None
+        db.drop_index("users", "a", "b")
+        with pytest.raises(pyx.PyxError):
+            users.find_one(a=1, b=2)

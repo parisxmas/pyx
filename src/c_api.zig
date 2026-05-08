@@ -731,6 +731,98 @@ export fn pyx_snapshot_find_range(
 }
 
 // ====================================================================
+// Compound indexes
+// ====================================================================
+
+/// Decode a `(field_ptrs, field_lens, n_fields)` triple from C into a
+/// stack-bounded array of slices. Returns null on null pointers or
+/// unsupported `n_fields`.
+fn collectCompoundFields(
+    fields_ptrs: ?[*]const ?[*]const u8,
+    field_lens: ?[*]const usize,
+    n_fields: usize,
+    out: *[16][]const u8,
+) ?[]const []const u8 {
+    if (n_fields == 0 or n_fields > out.len) return null;
+    const ptrs = fields_ptrs orelse return null;
+    const lens = field_lens orelse return null;
+    var i: usize = 0;
+    while (i < n_fields) : (i += 1) {
+        const p = ptrs[i] orelse return null;
+        out[i] = p[0..lens[i]];
+    }
+    return out[0..n_fields];
+}
+
+export fn pyx_create_compound_index(
+    db: ?*State,
+    coll: ?[*]const u8, coll_len: usize,
+    fields: ?[*]const ?[*]const u8,
+    field_lens: ?[*]const usize,
+    n_fields: usize,
+) c_int {
+    const s = db orelse return status_invalid_arg;
+    const c = nameSliceFromCArg(coll, coll_len) orelse return status_invalid_arg;
+    var stack: [16][]const u8 = undefined;
+    const fs = collectCompoundFields(fields, field_lens, n_fields, &stack) orelse return status_invalid_arg;
+    s.db.createCompoundIndex(c, fs) catch |err| {
+        setLastError("pyx_create_compound_index: {t}", .{err});
+        return statusFromError(err);
+    };
+    return status_ok;
+}
+
+export fn pyx_drop_compound_index(
+    db: ?*State,
+    coll: ?[*]const u8, coll_len: usize,
+    fields: ?[*]const ?[*]const u8,
+    field_lens: ?[*]const usize,
+    n_fields: usize,
+) c_int {
+    const s = db orelse return status_invalid_arg;
+    const c = nameSliceFromCArg(coll, coll_len) orelse return status_invalid_arg;
+    var stack: [16][]const u8 = undefined;
+    const fs = collectCompoundFields(fields, field_lens, n_fields, &stack) orelse return status_invalid_arg;
+    s.db.dropCompoundIndex(c, fs) catch |err| {
+        setLastError("pyx_drop_compound_index: {t}", .{err});
+        return statusFromError(err);
+    };
+    return status_ok;
+}
+
+export fn pyx_compound_find_one(
+    db: ?*State,
+    coll: ?[*]const u8, coll_len: usize,
+    fields: ?[*]const ?[*]const u8,
+    field_lens: ?[*]const usize,
+    n_fields: usize,
+    values: ?[*]const PyxValue,
+    out_doc_id: ?*u64,
+) c_int {
+    const s = db orelse return status_invalid_arg;
+    const c = nameSliceFromCArg(coll, coll_len) orelse return status_invalid_arg;
+    const out = out_doc_id orelse return status_invalid_arg;
+    var fields_stack: [16][]const u8 = undefined;
+    const fs = collectCompoundFields(fields, field_lens, n_fields, &fields_stack) orelse return status_invalid_arg;
+    const vs_ptr = values orelse return status_invalid_arg;
+    var values_stack: [16]doc_mod.Value = undefined;
+    if (n_fields > values_stack.len) return status_invalid_arg;
+    var i: usize = 0;
+    while (i < n_fields) : (i += 1) {
+        values_stack[i] = convertValue(&vs_ptr[i]) catch return status_invalid_arg;
+    }
+    const id = s.db.collection(c).findOneCompound(fs, values_stack[0..n_fields]) catch |err| {
+        setLastError("pyx_compound_find_one: {t}", .{err});
+        return statusFromError(err);
+    };
+    if (id) |found| {
+        out.* = found;
+        return status_ok;
+    }
+    return status_not_found;
+}
+
+// ====================================================================
 // Optimistic concurrency
 // ====================================================================
 
@@ -1091,4 +1183,74 @@ test "C ABI: OCC commit returns write_conflict on observed-value change" {
     // OCC stages its own write and tries to commit → conflict.
     try testing.expectEqual(status_ok, pyx_optimistic_put(txn, coll.ptr, coll.len, id, &v2, v2.len));
     try testing.expectEqual(status_write_conflict, pyx_optimistic_commit(txn));
+}
+
+test "C ABI: compound index create + find + drop" {
+    const path = cabiPath("c-abi-compound.db");
+    var db: *State = undefined;
+    try testing.expectEqual(status_ok, pyx_open(path.ptr, &db));
+    defer pyx_close(db);
+    pyx_set_sync_mode(db, 1);
+
+    // Insert two docs with last/first via the binary doc Builder.
+    const coll = "u";
+    const Builder = pyx.doc.Builder;
+    const ally = std.testing.allocator;
+
+    var bytes_a: []u8 = undefined;
+    {
+        var b = Builder.init(ally);
+        defer b.deinit();
+        try b.beginDocument();
+        try b.putString("last", "smith");
+        try b.putString("first", "alice");
+        try b.endDocument();
+        bytes_a = try b.finish();
+    }
+    defer ally.free(bytes_a);
+    var bytes_b: []u8 = undefined;
+    {
+        var b = Builder.init(ally);
+        defer b.deinit();
+        try b.beginDocument();
+        try b.putString("last", "smith");
+        try b.putString("first", "bob");
+        try b.endDocument();
+        bytes_b = try b.finish();
+    }
+    defer ally.free(bytes_b);
+
+    var id_a: u64 = 0;
+    var id_b: u64 = 0;
+    try testing.expectEqual(status_ok, pyx_insert(db, coll.ptr, coll.len, bytes_a.ptr, bytes_a.len, &id_a));
+    try testing.expectEqual(status_ok, pyx_insert(db, coll.ptr, coll.len, bytes_b.ptr, bytes_b.len, &id_b));
+
+    // Build the field-pointer arrays.
+    const last = "last";
+    const first = "first";
+    const field_ptrs = [2]?[*]const u8{ last.ptr, first.ptr };
+    const field_lens = [2]usize{ last.len, first.len };
+
+    try testing.expectEqual(status_ok, pyx_create_compound_index(
+        db, coll.ptr, coll.len, &field_ptrs, &field_lens, 2,
+    ));
+
+    // Lookup (smith, alice) → id_a.
+    const v_smith = PyxValue{ .type = .string, .as = .{ .string = .{ .ptr = "smith".ptr, .len = 5 } } };
+    const v_alice = PyxValue{ .type = .string, .as = .{ .string = .{ .ptr = "alice".ptr, .len = 5 } } };
+    const values = [2]PyxValue{ v_smith, v_alice };
+    var got: u64 = 0;
+    try testing.expectEqual(status_ok, pyx_compound_find_one(
+        db, coll.ptr, coll.len, &field_ptrs, &field_lens, 2, &values, &got,
+    ));
+    try testing.expectEqual(id_a, got);
+
+    // Drop → subsequent find raises no_such_index.
+    try testing.expectEqual(status_ok, pyx_drop_compound_index(
+        db, coll.ptr, coll.len, &field_ptrs, &field_lens, 2,
+    ));
+    const drop_status = pyx_compound_find_one(
+        db, coll.ptr, coll.len, &field_ptrs, &field_lens, 2, &values, &got,
+    );
+    try testing.expectEqual(@intFromEnum(Status.no_such_index), drop_status);
 }
