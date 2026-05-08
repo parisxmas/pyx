@@ -325,4 +325,4 @@ Python tests live under `bindings/python/tests/` and are run with
 
 ## License
 
-TBD.
+Apache License 2.0 — see [LICENSE](LICENSE). Copyright © 2026 Baris Akin.
