@@ -306,10 +306,12 @@ Caveats:
   conflict. Indexed range reads (`findOne`, `findAll`, `findRange`)
   *are* tracked. If you need full-scan tracking, define an index and
   use `findRange`.
-- **`runOptimistic` does not back off** between attempts. Two threads
-  contending on the same hot key can livelock the retry loop on each
-  other; wrap with your own `std.Thread.sleep` if your workload has
-  hot keys.
+- **`runOptimistic` retries with exponential backoff + full jitter**
+  (cap doubles from 100 µs up to 10 ms; sleep is uniformly random in
+  `[0, cap)`). The randomness prevents synchronised retry storms when
+  many threads conflict on the same key. Bypass this and write your
+  own retry loop with `Db.beginOptimistic` directly if you need a
+  different policy.
 
 Lost-update protection is automatic: every `put`/`delete` performs an
 implicit snapshot read of its target key before recording the write,
@@ -544,8 +546,8 @@ Python tests live under `bindings/python/tests/` and are run with
       commit. Lost-update protection for blind writes via implicit
       snapshot read on `put`/`delete`. Phantom protection for indexed
       reads (`findOne` / `findAll` / `findRange`) via match-list
-      replay at validation. Full-scan `iterator` tracking and
-      `runOptimistic` backoff still TODO.
+      replay at validation. `runOptimistic` retries with exponential
+      backoff + full jitter. Full-scan `iterator` tracking still TODO.
 - [ ] Concurrent B+Tree mutations (per-page locks, keyspace sharding,
       or LSM) — break past the `db.mu` ceiling for `.full`-mode
       auto-commit throughput.

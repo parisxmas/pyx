@@ -256,15 +256,15 @@ pub const Db = struct {
 
     /// Run an OCC transaction with automatic retry on
     /// `error.WriteConflict`. The caller's `func` receives the active
-    /// txn handle and returns either a value (any user error type) or
-    /// void; on success the helper commits, on `WriteConflict` it
-    /// abandons the txn and starts a fresh one. Other user errors
+    /// txn handle; on success the helper commits, on `WriteConflict`
+    /// it abandons the txn, sleeps with exponential backoff + full
+    /// jitter, and starts a fresh one. Other user errors
     /// short-circuit and are returned to the caller.
     ///
-    /// Note: this version does NOT sleep between attempts. Two threads
-    /// contending on the same hot key can livelock the retry loop on
-    /// each other. If you have a contention-prone workload, wrap this
-    /// with your own backoff (`std.Thread.sleep` etc).
+    /// Backoff schedule: cap doubles on each conflict from 100 µs up
+    /// to 10 ms; the actual sleep is uniformly drawn from `[0, cap)`
+    /// (AWS "full jitter" — avoids synchronised retry storms when
+    /// many threads conflict on the same key).
     ///
     /// Returns `error.RetryBudgetExhausted` if `max_attempts` is
     /// reached without a successful commit.
@@ -274,6 +274,12 @@ pub const Db = struct {
         context: anytype,
         comptime func: fn (@TypeOf(context), *OptimisticTxn) anyerror!void,
     ) !void {
+        const initial_backoff_ns: u64 = 100 * std.time.ns_per_us; // 100 µs
+        const max_backoff_ns: u64 = 10 * std.time.ns_per_ms; //     10 ms
+        var backoff_cap_ns: u64 = initial_backoff_ns;
+        var prng_seeded = false;
+        var prng: std.Random.DefaultPrng = undefined;
+
         var attempts: u32 = 0;
         while (attempts < max_attempts) : (attempts += 1) {
             var txn = try self.beginOptimistic();
@@ -285,7 +291,24 @@ pub const Db = struct {
                 return e;
             };
             txn.commit() catch |e| switch (e) {
-                error.WriteConflict => continue,
+                error.WriteConflict => {
+                    if (!prng_seeded) {
+                        const ts = Io.Clock.Timestamp.now(self.pager.io, .awake);
+                        const seed: u64 = @as(u64, @truncate(@as(u128, @intCast(ts.raw.toNanoseconds())))) ^
+                            @as(u64, @intCast(std.Thread.getCurrentId()));
+                        prng = std.Random.DefaultPrng.init(seed);
+                        prng_seeded = true;
+                    }
+                    if (backoff_cap_ns > 0) {
+                        const sleep_ns = prng.random().uintLessThan(u64, backoff_cap_ns);
+                        if (sleep_ns > 0) {
+                            const dur = Io.Duration.fromNanoseconds(@intCast(sleep_ns));
+                            self.pager.io.sleep(dur, .awake) catch {};
+                        }
+                    }
+                    backoff_cap_ns = @min(backoff_cap_ns *| 2, max_backoff_ns);
+                    continue;
+                },
                 else => return e,
             };
             return;
@@ -2521,4 +2544,110 @@ test "OptimisticTxn: findAll phantom — concurrent insert with same value confl
     _ = try db.collection("u").insert(a2);
 
     try testing.expectError(Error.WriteConflict, txn.commit());
+}
+
+test "Db.runOptimistic: retries N times on conflict, succeeds when contention stops" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-retry.db");
+    defer db.close();
+
+    const seed_doc = try buildDoc("seed", 0);
+    defer ally.free(seed_doc);
+    const id = try db.collection("c").insert(seed_doc);
+    try db.checkpoint();
+
+    // The user-supplied func reads the doc (records read_set), then —
+    // on the *first* `target_conflicts` invocations — bumps the live
+    // doc through the regular API to force a WriteConflict at commit.
+    // After enough conflicts it stops bumping and the retry succeeds.
+    const Ctx = struct {
+        db: *Db,
+        id: u64,
+        conflicts_to_force: u32,
+        attempts: *u32,
+
+        fn run(self: *@This(), txn: *OptimisticTxn) !void {
+            self.attempts.* += 1;
+            const c = txn.collection("c");
+            const v = try c.get(testing.allocator, self.id);
+            defer if (v) |vv| testing.allocator.free(vv);
+            if (self.attempts.* <= self.conflicts_to_force) {
+                // Step the live doc out from under us. This commit
+                // happens on the same thread but uses the pessimistic
+                // path, so it doesn't touch txn's snapshot — when txn
+                // commits, validation will see the change and conflict.
+                var b = Builder.init(testing.allocator);
+                defer b.deinit();
+                try b.beginDocument();
+                try b.putI64("count", @intCast(self.attempts.*));
+                try b.endDocument();
+                const bytes = try b.finish();
+                defer testing.allocator.free(bytes);
+                try self.db.collection("c").put(self.id, bytes);
+            }
+            // Always do at least one OCC write so the apply phase has
+            // something to do.
+            const new_v = try buildDoc("after-retry", 999);
+            defer testing.allocator.free(new_v);
+            try c.put(self.id, new_v);
+        }
+    };
+
+    var attempts: u32 = 0;
+    var ctx = Ctx{ .db = &db, .id = id, .conflicts_to_force = 3, .attempts = &attempts };
+    try db.runOptimistic(8, &ctx, Ctx.run);
+    // Expected: 3 forced conflicts + 1 successful = 4 attempts.
+    try testing.expectEqual(@as(u32, 4), attempts);
+
+    const final = (try db.collection("c").get(ally, id)).?;
+    defer ally.free(final);
+    const parsed = try doc_mod.parse(final);
+    const name = (try parsed.object.get("name")).?.string;
+    try testing.expectEqualStrings("after-retry", name);
+}
+
+test "Db.runOptimistic: returns RetryBudgetExhausted when conflicts persist" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-budget.db");
+    defer db.close();
+
+    const seed_doc = try buildDoc("seed", 0);
+    defer ally.free(seed_doc);
+    const id = try db.collection("c").insert(seed_doc);
+    try db.checkpoint();
+
+    // Always force a conflict — every attempt bumps the live doc.
+    const Ctx = struct {
+        db: *Db,
+        id: u64,
+        attempts: *u32,
+        fn run(self: *@This(), txn: *OptimisticTxn) !void {
+            self.attempts.* += 1;
+            const c = txn.collection("c");
+            const v = try c.get(testing.allocator, self.id);
+            defer if (v) |vv| testing.allocator.free(vv);
+            var b = Builder.init(testing.allocator);
+            defer b.deinit();
+            try b.beginDocument();
+            try b.putI64("count", @intCast(self.attempts.*));
+            try b.endDocument();
+            const bytes = try b.finish();
+            defer testing.allocator.free(bytes);
+            try self.db.collection("c").put(self.id, bytes);
+            // Stage an OCC put as well so the txn has work to do.
+            const new_v = try buildDoc("nope", 0);
+            defer testing.allocator.free(new_v);
+            try c.put(self.id, new_v);
+        }
+    };
+
+    var attempts: u32 = 0;
+    var ctx = Ctx{ .db = &db, .id = id, .attempts = &attempts };
+    // Cap at 3 so the test stays fast (backoff caps at 10ms × 3 attempts).
+    try testing.expectError(Error.RetryBudgetExhausted, db.runOptimistic(3, &ctx, Ctx.run));
+    try testing.expectEqual(@as(u32, 3), attempts);
 }
