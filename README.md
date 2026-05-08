@@ -368,11 +368,11 @@ APFS on internal SSD, Zig 0.16.0, SQLite 3.53.0 (Homebrew).
 
 | Operation               | pyx (normal) | SQLite WAL+NORMAL | SQLite default | pyx vs WAL |
 |-------------------------|-------------:|------------------:|---------------:|-----------:|
-| insert (auto-commit)    | **237 k/s**  | 109 k/s           |  5.2 k/s       | **2.2×**   |
-| insert (batched in txn) | **4.53 M/s** | 3.21 M/s          |  2.83 M/s      | **1.4×**   |
-| random `get` by id      | **3.06 M/s** | 1.13 M/s          |  386 k/s       | **2.7×**   |
-| full collection iterate | **224 M docs/s** | 31 M docs/s    |  31 M docs/s   | **7.2×**   |
-| indexed `findOne`       | **1.31 M/s** | 1.24 M/s          |  389 k/s       | **1.1×**   |
+| insert (auto-commit)    | **234 k/s**  | 104 k/s           |  5.6 k/s       | **2.3×**   |
+| insert (batched in txn) | **4.04 M/s** | 3.19 M/s          |  2.89 M/s      | **1.3×**   |
+| random `get` by id      | **2.89 M/s** | 1.26 M/s          |  380 k/s       | **2.3×**   |
+| full collection iterate | **190 M docs/s** | 34 M docs/s    |  33 M docs/s   | **5.6×**   |
+| indexed `findOne`       | **1.35 M/s** | 1.23 M/s          |  386 k/s       | **1.1×**   |
 
 `zig build bench` / `zig build bench-sqlite` to reproduce.
 
@@ -383,10 +383,10 @@ indexed point query):
 
 | Threads | pyx aggregate | SQLite WAL aggregate | pyx advantage |
 |---------|--------------:|---------------------:|--------------:|
-| 1       | 1.38 M ops/s  | 716 k ops/s          | 1.9×          |
-| 2       | 2.75 M ops/s  | 1.02 M ops/s         | 2.7×          |
-| 4       | 5.37 M ops/s  | 828 k ops/s          | 6.5×          |
-| 8       | **7.42 M ops/s** | 325 k ops/s        | **23×**       |
+| 1       | 1.37 M ops/s  | 726 k ops/s          | 1.9×          |
+| 2       | 2.72 M ops/s  | 1.02 M ops/s         | 2.7×          |
+| 4       | 5.34 M ops/s  | 830 k ops/s          | 6.4×          |
+| 8       | **7.65 M ops/s** | 333 k ops/s        | **23×**       |
 
 pyx scales near-linearly because snapshot reads are lock-free and
 mmap-backed. SQLite's WAL reader path serialises on the wal-index
@@ -397,13 +397,13 @@ degrades past four.
 
 | Phase    | pyx writer        | pyx readers   | SQLite writer | SQLite readers |
 |----------|------------------:|--------------:|--------------:|---------------:|
-| 1w + 1r  | 676 k inserts/s   | 1.32 M ops/s  | 661 k inserts/s | 603 k ops/s  |
-| 1w + 2r  | 349 k inserts/s   | 2.64 M ops/s  | 352 k inserts/s | 674 k ops/s  |
-| 1w + 4r  | 293 k inserts/s   | 4.25 M ops/s  | 137 k inserts/s | 527 k ops/s  |
-| 1w + 8r  | **212 k inserts/s** | **6.18 M ops/s** | **43 k inserts/s** | **328 k ops/s** |
+| 1w + 1r  | 671 k inserts/s   | 1.31 M ops/s  | 659 k inserts/s | 610 k ops/s  |
+| 1w + 2r  | 619 k inserts/s   | 2.62 M ops/s  | 352 k inserts/s | 671 k ops/s  |
+| 1w + 4r  | 324 k inserts/s   | 4.43 M ops/s  | 140 k inserts/s | 547 k ops/s  |
+| 1w + 8r  | **315 k inserts/s** | **4.48 M ops/s** | **44 k inserts/s** | **332 k ops/s** |
 
 Under concurrent read pressure, pyx's writer holds steady around
-210 k inserts/s while SQLite's collapses to 43 k. pyx's readers keep
+300 k inserts/s while SQLite's collapses to 44 k. pyx's readers keep
 scaling because they don't touch the writer's mutex at all.
 
 `zig build bench-concurrent` / `zig build bench-concurrent-sqlite` to
@@ -418,10 +418,10 @@ workload group commit was designed for. 1 s per sub-phase:
 
 | Writers | commits/s | fsync avg | commits per fsync |
 |---------|----------:|----------:|------------------:|
-| 1       |   34 k    | 14.5 µs   | 1.00              |
-| 2       |   44 k    | 14.9 µs   | 1.00              |
-| 4       |   42 k    | 16.4 µs   | 1.00              |
-| 8       |   40 k    | 16.5 µs   | 1.00              |
+| 1       |   33 k    | 14.7 µs   | 1.00              |
+| 2       |   44 k    | 15.3 µs   | 1.00              |
+| 4       |   42 k    | 14.8 µs   | 1.00              |
+| 8       |  ~40 k    | 16.5 µs   | 1.00              |
 
 The 1.3× lift from W=1 to W=2 is the realised group-commit win —
 removing redundant fsyncs in the rare cases where a follower's
@@ -445,7 +445,7 @@ snapshot, so this stresses the `Db.snapshot()` path:
 | 1       |  3.4 k    | 0                      |
 | 2       |  3.9 k    | 0                      |
 | 4       |  3.6 k    | 0                      |
-| 8       |  3.2 k    | 0                      |
+| 8       |  3.5 k    | 0                      |
 
 Throughput plateaus around 3-4 k commits/s — `db.mu`-bound on the
 validate-and-apply phase (B+Tree CoW + index update for the
@@ -464,9 +464,9 @@ Numbers in microseconds:
 
 | State                          | snapshot() |
 |--------------------------------|-----------:|
-| empty page cache               |   1.5 µs   |
-| 1-commit dirty cache           |  14   µs   |
-| 1000-commit dirty cache (rare) | 4.1 ms     |
+| empty page cache               |   2.0 µs   |
+| 1-commit dirty cache           |  15   µs   |
+| 1000-commit dirty cache (rare) | 4.5 ms     |
 
 Capture is a soft-flush — pwrite the dirty page cache into the kernel
 page cache (where mmap reads from), without fsync or WAL truncate.
