@@ -122,7 +122,7 @@ pub const Manager = struct {
     /// Restore in-memory index lists by scanning both registry
     /// namespaces (single-field at \x02, compound at \x03).
     pub fn loadFromPager(self: *Manager, pager: *pager_mod.Pager) !void {
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot() };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
         {
             var it = try view.iteratorFrom(self.allocator, &.{ns_registry});
             defer it.deinit();
@@ -163,7 +163,7 @@ pub const Manager = struct {
         doc_id: u64,
         doc_bytes: []const u8,
     ) !void {
-        const bt = btree_mod.BTree.init(self.allocator, pager);
+        const bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
         for (self.indexes.items) |def| {
             if (!def.matches(coll)) continue;
             try addIndexEntry(self.allocator, bt, def, doc_id, doc_bytes);
@@ -183,7 +183,7 @@ pub const Manager = struct {
         doc_id: u64,
         old_doc: []const u8,
     ) !void {
-        const bt = btree_mod.BTree.init(self.allocator, pager);
+        const bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
         for (self.indexes.items) |def| {
             if (!def.matches(coll)) continue;
             try removeIndexEntry(self.allocator, bt, def, doc_id, old_doc);
@@ -216,7 +216,7 @@ pub const Manager = struct {
             if (def.matches(coll) and mem.eql(u8, def.field_path, field)) return;
         }
 
-        const bt = btree_mod.BTree.init(self.allocator, pager);
+        const bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
 
         // Phase 1: scan upfront, dupe each value so it survives subsequent
         // tree mutations.
@@ -229,7 +229,7 @@ pub const Manager = struct {
 
         var prefix_buf: [max_index_key_size]u8 = undefined;
         const prefix_len = encodeCollectionPrefix(&prefix_buf, coll);
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot() };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
         {
             var it = try view.iteratorFrom(self.allocator, prefix_buf[0..prefix_len]);
             defer it.deinit();
@@ -281,7 +281,7 @@ pub const Manager = struct {
         const removed = self.indexes.orderedRemove(found_idx.?);
         defer removed.deinit(self.allocator);
 
-        const bt = btree_mod.BTree.init(self.allocator, pager);
+        const bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
 
         // Remove registry entry.
         var key_buf: [max_index_key_size]u8 = undefined;
@@ -297,7 +297,7 @@ pub const Manager = struct {
             for (to_delete.items) |k| self.allocator.free(k);
             to_delete.deinit(self.allocator);
         }
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot() };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
         var it = try view.iteratorFrom(self.allocator, prefix_buf[0..prefix_len]);
         defer it.deinit();
         while (try it.next()) |entry| {
@@ -325,7 +325,7 @@ pub const Manager = struct {
             if (def.matches(coll) and def.fieldsEql(fields)) return;
         }
 
-        const bt = btree_mod.BTree.init(self.allocator, pager);
+        const bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
 
         // Phase 1: snapshot the collection's primary entries before any
         // writes, so subsequent index inserts can't perturb our scan.
@@ -337,7 +337,7 @@ pub const Manager = struct {
         }
         var prefix_buf: [max_index_key_size]u8 = undefined;
         const prefix_len = encodeCollectionPrefix(&prefix_buf, coll);
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot() };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
         {
             var it = try view.iteratorFrom(self.allocator, prefix_buf[0..prefix_len]);
             defer it.deinit();
@@ -397,7 +397,7 @@ pub const Manager = struct {
         const removed = self.compound.orderedRemove(found_idx.?);
         defer removed.deinit(self.allocator);
 
-        const bt = btree_mod.BTree.init(self.allocator, pager);
+        const bt = btree_mod.BTree.init(self.allocator, pager, pager_mod.default_collection_id);
 
         var key_buf: [max_index_key_size]u8 = undefined;
         const key_len = try encodeCompoundRegistryKey(&key_buf, coll, fields);
@@ -412,7 +412,7 @@ pub const Manager = struct {
             for (to_delete.items) |k| self.allocator.free(k);
             to_delete.deinit(self.allocator);
         }
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot() };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
         var it = try view.iteratorFrom(self.allocator, prefix_buf[0..prefix_len]);
         defer it.deinit();
         while (try it.next()) |entry| {
@@ -438,7 +438,7 @@ pub const Manager = struct {
         fields: []const []const u8,
         values: []const doc_mod.Value,
     ) !?u64 {
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot() };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
         return self.findOneCompoundInView(view, coll, fields, values);
     }
 
@@ -471,7 +471,7 @@ pub const Manager = struct {
         field: []const u8,
         value: doc_mod.Value,
     ) !?u64 {
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot() };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
         return self.findOneInView(view, coll, field, value);
     }
 
@@ -508,7 +508,7 @@ pub const Manager = struct {
         field: []const u8,
         value: doc_mod.Value,
     ) !LookupIterator {
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot() };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
         return self.findAllInView(allocator, view, coll, field, value);
     }
 
@@ -553,7 +553,7 @@ pub const Manager = struct {
         lo: Bound,
         hi: Bound,
     ) !RangeIterator {
-        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot() };
+        const view = btree_mod.View{ .pager = pager, .file = pager.file, .io = pager.io, .root = pager.bTreeRoot(pager_mod.default_collection_id) };
         return self.findRangeInView(allocator, view, coll, field, lo, hi);
     }
 

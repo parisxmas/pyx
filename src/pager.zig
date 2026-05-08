@@ -45,6 +45,15 @@ const recovery_lock_region: flock_mod.Region = .{ .start = 2, .len = 1 };
 pub const page_size: u32 = 4096;
 pub const PageId = u32;
 
+/// Identifies a logical B+Tree within the DB file. Today every DB has
+/// exactly one tree (id 0, the "default collection"), but the type
+/// flows through every page-allocator and tree-root call site so that
+/// the keyspace-sharding work (multiple roots / per-collection WRITER
+/// locks) can land without API churn.
+pub const CollectionId = u32;
+pub const default_collection_id: CollectionId = 0;
+pub const max_collections: usize = 16;
+
 const magic: [8]u8 = .{ 'P', 'Y', 'X', 'D', 'B', '0', '0', '1' };
 const format_version: u32 = 1;
 
@@ -746,30 +755,37 @@ pub const Pager = struct {
         }
     }
 
-    pub fn setBTreeRoot(self: *Pager, id: PageId) !void {
-        if (self.header.btree_root == id) return; // no-op if unchanged
+    pub fn setBTreeRoot(self: *Pager, collection_id: CollectionId, new_root: PageId) !void {
+        // Phase 1 of keyspace sharding: only the default collection
+        // exists. The id parameter is plumbed through every call site
+        // so phase 2's per-collection catalog can land without API
+        // changes; for now `header.btree_root` is the single source of
+        // truth and any non-default id is a programming error.
+        std.debug.assert(collection_id == default_collection_id);
+        if (self.header.btree_root == new_root) return; // no-op if unchanged
         if (self.in_txn) {
             // Update only the in-process header during the txn — shm
             // is updated atomically at applyAndFinalize, AFTER all
             // dirty pages are on disk, so other processes never see a
             // root pointing at pages the file doesn't have yet.
-            self.header.btree_root = id;
+            self.header.btree_root = new_root;
             self.header_dirty = true;
             return;
         }
         try self.begin();
         errdefer self.abort();
-        self.header.btree_root = id;
+        self.header.btree_root = new_root;
         self.header_dirty = true;
         try self.commit();
     }
 
-    /// The live B+Tree root. Inside a txn, this is the in-process
-    /// header's value — the work-in-progress root that subsequent
-    /// reads (e.g. index lookups during a multi-op write) must walk.
-    /// Outside a txn, it's the shm-resident value, so any process
-    /// that has the DB open sees the latest committed root.
-    pub fn bTreeRoot(self: *Pager) PageId {
+    /// The live B+Tree root for `collection_id`. Inside a txn, this is
+    /// the in-process header's value — the work-in-progress root that
+    /// subsequent reads (e.g. index lookups during a multi-op write)
+    /// must walk. Outside a txn, it's the shm-resident value, so any
+    /// process that has the DB open sees the latest committed root.
+    pub fn bTreeRoot(self: *Pager, collection_id: CollectionId) PageId {
+        std.debug.assert(collection_id == default_collection_id);
         if (self.in_txn) return self.header.btree_root;
         return @intCast(self.shm.btreeRoot().load(.acquire));
     }

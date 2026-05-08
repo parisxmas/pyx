@@ -102,7 +102,7 @@ const ReplayCtx = struct {
             }),
             .delete => |k| try self.pending.append(self.allocator, .{ .delete = try self.allocator.dupe(u8, k) }),
             .commit => |c| {
-                const bt = btree_mod.BTree.init(self.allocator, self.pager);
+                const bt = btree_mod.BTree.init(self.allocator, self.pager, pager_mod.default_collection_id);
                 for (self.pending.items) |op| {
                     switch (op) {
                         .put => |p| try bt.put(p.key, p.value),
@@ -317,7 +317,10 @@ pub const Db = struct {
     }
 
     pub fn collection(self: *Db, name: []const u8) Collection {
-        return .{ .db = self, .name = name };
+        // Phase 1 of keyspace sharding: every collection name resolves
+        // to the single shared default tree. Phase 2 will look the id
+        // up in a persistent registry.
+        return .{ .db = self, .name = name, .id = pager_mod.default_collection_id };
     }
 
     /// Capture a consistent point-in-time view of the database. The
@@ -342,7 +345,7 @@ pub const Db = struct {
         if (self.ownsTxn()) {
             return .{
                 .db = self,
-                .btree_root = self.pager.bTreeRoot(),
+                .btree_root = self.pager.bTreeRoot(pager_mod.default_collection_id),
                 .file = self.pager.file,
                 .io = self.pager.io,
                 .lock_free = false,
@@ -371,7 +374,7 @@ pub const Db = struct {
         ) catch null;
         return .{
             .db = self,
-            .btree_root = self.pager.bTreeRoot(),
+            .btree_root = self.pager.bTreeRoot(pager_mod.default_collection_id),
             .file = self.pager.file,
             .io = self.pager.io,
             .lock_free = true,
@@ -462,9 +465,10 @@ pub const Db = struct {
 pub const Collection = struct {
     db: *Db,
     name: []const u8,
+    id: pager_mod.CollectionId,
 
     fn btree(self: Collection) btree_mod.BTree {
-        return btree_mod.BTree.init(self.db.allocator, &self.db.pager);
+        return btree_mod.BTree.init(self.db.allocator, &self.db.pager, self.id);
     }
 
     pub fn insert(self: Collection, doc_bytes: []const u8) !u64 {
@@ -569,7 +573,7 @@ pub const Collection = struct {
         const locked = !self.db.ownsTxn();
         if (locked) self.db.mu.lockUncancelable(self.db.pager.io);
         defer if (locked) self.db.mu.unlock(self.db.pager.io);
-        return Iterator.openWithRoot(allocator, &self.db.pager, self.db.pager.bTreeRoot(), self.name);
+        return Iterator.openWithRoot(allocator, &self.db.pager, self.db.pager.bTreeRoot(self.id), self.name);
     }
 
     pub fn count(self: Collection, allocator: Allocator) !u64 {
@@ -677,7 +681,7 @@ pub const Snapshot = struct {
     mmap: ?std.Io.File.MemoryMap,
 
     pub fn collection(self: Snapshot, name: []const u8) SnapshotCollection {
-        return .{ .snapshot = self, .name = name };
+        return .{ .snapshot = self, .name = name, .id = pager_mod.default_collection_id };
     }
 
     pub fn deinit(self: *Snapshot) void {
@@ -691,6 +695,7 @@ pub const Snapshot = struct {
 pub const SnapshotCollection = struct {
     snapshot: Snapshot,
     name: []const u8,
+    id: pager_mod.CollectionId,
 
     fn view(self: SnapshotCollection) btree_mod.View {
         return .{
@@ -1002,7 +1007,7 @@ pub const OptimisticTxn = struct {
     };
 
     pub fn collection(self: *OptimisticTxn, name: []const u8) TxnCollection {
-        return .{ .txn = self, .name = name };
+        return .{ .txn = self, .name = name, .id = pager_mod.default_collection_id };
     }
 
     /// Validate the read set against the live tree, then apply the
@@ -1300,6 +1305,7 @@ fn liveMatchesEqual(it: anytype, expected: []const u64) !bool {
 pub const TxnCollection = struct {
     txn: *OptimisticTxn,
     name: []const u8,
+    id: pager_mod.CollectionId,
 
     pub fn insert(self: TxnCollection, doc_bytes: []const u8) !u64 {
         try validateName(self.name);
@@ -2246,7 +2252,7 @@ test "OptimisticTxn: start_root captured at begin reflects snapshot version" {
     _ = try db.collection("c").insert(seed);
     try db.checkpoint();
 
-    const root_before = db.pager.bTreeRoot();
+    const root_before = db.pager.bTreeRoot(pager_mod.default_collection_id);
     var txn = try db.beginOptimistic();
     try testing.expectEqual(root_before, txn.start_root);
     txn.abort();

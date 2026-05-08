@@ -533,9 +533,18 @@ pub const Iterator = struct {
 pub const BTree = struct {
     allocator: Allocator,
     pager: *Pager,
+    /// Identifies which tree-root in the pager this handle reads/writes
+    /// through. Phase 1 of keyspace sharding: only `default_collection_id`
+    /// is supported, but the field is plumbed everywhere so phase 2 can
+    /// flip on N independent roots without touching call sites.
+    collection_id: pager_mod.CollectionId,
 
-    pub fn init(allocator: Allocator, pager: *Pager) BTree {
-        return .{ .allocator = allocator, .pager = pager };
+    pub fn init(allocator: Allocator, pager: *Pager, collection_id: pager_mod.CollectionId) BTree {
+        return .{
+            .allocator = allocator,
+            .pager = pager,
+            .collection_id = collection_id,
+        };
     }
 
     pub fn view(self: BTree) View {
@@ -543,7 +552,7 @@ pub const BTree = struct {
             .pager = self.pager,
             .file = self.pager.file,
             .io = self.pager.io,
-            .root = self.pager.bTreeRoot(),
+            .root = self.pager.bTreeRoot(self.collection_id),
         };
     }
 
@@ -578,13 +587,13 @@ pub const BTree = struct {
     }
 
     fn putTxn(self: BTree, key: []const u8, value: []const u8) !void {
-        const old_root = self.pager.bTreeRoot();
+        const old_root = self.pager.bTreeRoot(self.collection_id);
         if (old_root == 0) {
             const new_root = try self.pager.allocPage();
             var page: [page_size]u8 = undefined;
             try buildLeaf(&page, &.{.{ .key = key, .value = value }}, 0);
             try self.pager.write(new_root, &page);
-            try self.pager.setBTreeRoot(new_root);
+            try self.pager.setBTreeRoot(self.collection_id, new_root);
             self.pager.txn_append_hint = new_root;
             return;
         }
@@ -628,12 +637,12 @@ pub const BTree = struct {
             );
             try self.pager.write(new_root, &page);
             self.allocator.free(sp.promoted_key);
-            try self.pager.setBTreeRoot(new_root);
+            try self.pager.setBTreeRoot(self.collection_id, new_root);
             // Hint invalidated by split. Next insert will re-descend and
             // set a fresh hint when it reaches a leaf.
             self.pager.txn_append_hint = null;
         } else if (result.new_id != old_root) {
-            try self.pager.setBTreeRoot(result.new_id);
+            try self.pager.setBTreeRoot(self.collection_id, result.new_id);
         }
     }
 
@@ -979,11 +988,11 @@ pub const BTree = struct {
     }
 
     fn deleteTxn(self: BTree, key: []const u8) !bool {
-        const old_root = self.pager.bTreeRoot();
+        const old_root = self.pager.bTreeRoot(self.collection_id);
         if (old_root == 0) return false;
         const result = try self.deleteRec(old_root, key) orelse return false;
         if (result.new_id != old_root) {
-            try self.pager.setBTreeRoot(result.new_id);
+            try self.pager.setBTreeRoot(self.collection_id, result.new_id);
         }
         // Conservative: any delete invalidates the append hint. The cached
         // last-key may have been the deleted entry; rather than verify,
@@ -1117,7 +1126,7 @@ test "empty tree: get returns null" {
     defer tmp.cleanup();
     var p = try openTestPager(&tmp);
     defer p.close();
-    const bt = BTree.init(testing.allocator, &p);
+    const bt = BTree.init(testing.allocator, &p, pager_mod.default_collection_id);
     const got = try bt.get(testing.allocator, "anything");
     try testing.expect(got == null);
 }
@@ -1127,7 +1136,7 @@ test "single put/get roundtrip" {
     defer tmp.cleanup();
     var p = try openTestPager(&tmp);
     defer p.close();
-    const bt = BTree.init(testing.allocator, &p);
+    const bt = BTree.init(testing.allocator, &p, pager_mod.default_collection_id);
 
     try bt.put("hello", "world");
     const got = (try bt.get(testing.allocator, "hello")).?;
@@ -1143,7 +1152,7 @@ test "many puts trigger splits and remain ordered" {
     defer tmp.cleanup();
     var p = try openTestPager(&tmp);
     defer p.close();
-    const bt = BTree.init(testing.allocator, &p);
+    const bt = BTree.init(testing.allocator, &p, pager_mod.default_collection_id);
 
     var key_buf: [16]u8 = undefined;
     var val_buf: [200]u8 = undefined;
@@ -1164,7 +1173,7 @@ test "many puts trigger splits and remain ordered" {
     }
 
     var root_page: [page_size]u8 = undefined;
-    try p.read(p.bTreeRoot(), &root_page);
+    try p.read(p.bTreeRoot(pager_mod.default_collection_id), &root_page);
     try testing.expectEqual(NodeType.internal, readHeader(&root_page).type);
 }
 
@@ -1173,7 +1182,7 @@ test "insertion in random order, iterator yields ascending" {
     defer tmp.cleanup();
     var p = try openTestPager(&tmp);
     defer p.close();
-    const bt = BTree.init(testing.allocator, &p);
+    const bt = BTree.init(testing.allocator, &p, pager_mod.default_collection_id);
 
     var prng = std.Random.DefaultPrng.init(0x1234);
     const r = prng.random();
@@ -1205,7 +1214,7 @@ test "update replaces value in place" {
     defer tmp.cleanup();
     var p = try openTestPager(&tmp);
     defer p.close();
-    const bt = BTree.init(testing.allocator, &p);
+    const bt = BTree.init(testing.allocator, &p, pager_mod.default_collection_id);
 
     try bt.put("k", "v1");
     try bt.put("k", "v2-longer");
@@ -1219,7 +1228,7 @@ test "delete: removes key, others remain" {
     defer tmp.cleanup();
     var p = try openTestPager(&tmp);
     defer p.close();
-    const bt = BTree.init(testing.allocator, &p);
+    const bt = BTree.init(testing.allocator, &p, pager_mod.default_collection_id);
 
     try bt.put("a", "1");
     try bt.put("b", "2");
@@ -1242,11 +1251,11 @@ test "delete last entry of root leaf empties the tree" {
     defer tmp.cleanup();
     var p = try openTestPager(&tmp);
     defer p.close();
-    const bt = BTree.init(testing.allocator, &p);
+    const bt = BTree.init(testing.allocator, &p, pager_mod.default_collection_id);
 
     try bt.put("x", "1");
     try testing.expect(try bt.delete("x"));
-    try testing.expectEqual(@as(PageId, 0), p.bTreeRoot());
+    try testing.expectEqual(@as(PageId, 0), p.bTreeRoot(pager_mod.default_collection_id));
     try testing.expect(try bt.get(testing.allocator, "x") == null);
 }
 
@@ -1259,7 +1268,7 @@ test "data survives close + reopen" {
     {
         var p = try Pager.open(ally, io, tmp.dir, "persist.db");
         defer p.close();
-        const bt = BTree.init(ally, &p);
+        const bt = BTree.init(ally, &p, pager_mod.default_collection_id);
         try bt.put("alpha", "A");
         try bt.put("bravo", "B");
         try bt.put("charlie", "C");
@@ -1267,7 +1276,7 @@ test "data survives close + reopen" {
     {
         var p = try Pager.open(ally, io, tmp.dir, "persist.db");
         defer p.close();
-        const bt = BTree.init(ally, &p);
+        const bt = BTree.init(ally, &p, pager_mod.default_collection_id);
         const a = (try bt.get(ally, "alpha")).?;
         defer ally.free(a);
         const b = (try bt.get(ally, "bravo")).?;
@@ -1285,7 +1294,7 @@ test "rejects oversized key" {
     defer tmp.cleanup();
     var p = try openTestPager(&tmp);
     defer p.close();
-    const bt = BTree.init(testing.allocator, &p);
+    const bt = BTree.init(testing.allocator, &p, pager_mod.default_collection_id);
 
     var big_key: [max_key_size + 1]u8 = @splat('k');
     try testing.expectError(Error.KeyTooLarge, bt.put(&big_key, "v"));
@@ -1296,7 +1305,7 @@ test "stress: mixed-size values, random keys, all readable after" {
     defer tmp.cleanup();
     var p = try openTestPager(&tmp);
     defer p.close();
-    const bt = BTree.init(testing.allocator, &p);
+    const bt = BTree.init(testing.allocator, &p, pager_mod.default_collection_id);
 
     var prng = std.Random.DefaultPrng.init(0xfeedface);
     const r = prng.random();
@@ -1344,7 +1353,7 @@ test "snapshot: view at captured root keeps seeing old data after writes" {
     defer tmp.cleanup();
     var p = try openTestPager(&tmp);
     defer p.close();
-    const bt = BTree.init(testing.allocator, &p);
+    const bt = BTree.init(testing.allocator, &p, pager_mod.default_collection_id);
 
     try bt.put("a", "v1");
     try bt.put("b", "v1");
@@ -1382,7 +1391,7 @@ test "snapshot iterator unaffected by concurrent writes" {
     defer tmp.cleanup();
     var p = try openTestPager(&tmp);
     defer p.close();
-    const bt = BTree.init(testing.allocator, &p);
+    const bt = BTree.init(testing.allocator, &p, pager_mod.default_collection_id);
 
     var key_buf: [16]u8 = undefined;
     for (0..50) |i| {

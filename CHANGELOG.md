@@ -7,6 +7,17 @@ tag goes under `## Unreleased`.
 
 ## Unreleased
 
+### Added
+- Keyspace sharding, phase 1: `pager.bTreeRoot` / `pager.setBTreeRoot`
+  are now parameterized by `CollectionId` (typedef `u32`, with
+  `default_collection_id = 0` reserved for today's single-tree state).
+  `BTree` carries its own collection id, threaded through from
+  `Collection` / `SnapshotCollection` / `TxnCollection`. Pure refactor:
+  every id resolves to the default, so behaviour is bit-identical and
+  all 89 tests pass. The plumbing exists so phase 2's per-collection
+  catalog (separate roots, separate WRITER lock byte ranges) can land
+  without touching every call site again.
+
 ## 0.3.0 — 2026-05-08
 
 The headline of 0.3.0 is **multi-process safety**: opening the same
