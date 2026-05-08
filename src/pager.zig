@@ -340,6 +340,10 @@ pub const Pager = struct {
         // One pwritev for the whole batch (PUTs + COMMIT). Records reach
         // the kernel page cache here; durability is the next phase's job.
         try self.wal.flush();
+        // Publish the new high-water mark to the fsync queue. Any leader
+        // that takes its snapshot after this `store` is guaranteed to
+        // see (and fsync) our records.
+        self.wal.last_flushed_lsn.store(commit_lsn, .release);
         return commit_lsn;
     }
 
@@ -348,19 +352,15 @@ pub const Pager = struct {
     /// (records being replayed are already on disk).
     ///
     /// Lock-free with respect to the data lock: callers may release
-    /// `db.mu` before invoking this. Calls `wal.fsync` (fsync only — no
-    /// flush of the staging buffer), so there is no race against another
-    /// thread's `commitAppend` running under the lock.
-    ///
-    /// `lsn` is currently unused — every call issues a fresh fsync in
-    /// `.full` mode. Phase 3 will track a fsynced-LSN watermark and
-    /// short-circuit followers whose commits were already covered by an
-    /// earlier leader's fsync.
+    /// `db.mu` before invoking this. Concurrent fsync requests coalesce
+    /// inside `wal.syncToLsn` via a leader/follower queue — N writers
+    /// hitting `.full`-mode commit at once typically pay one fsync, not
+    /// N. Followers whose `lsn` was already covered by an earlier
+    /// leader's fsync return without issuing any syscall.
     pub fn syncTo(self: *Pager, lsn: u64) !void {
-        _ = lsn;
         if (self.in_recovery) return;
         if (self.sync_mode != .full) return;
-        try self.wal.fsync();
+        try self.wal.syncToLsn(lsn);
     }
 
     /// Phase-1 helper. Move dirty pages into the page cache and reset the

@@ -72,6 +72,29 @@ pub const Wal = struct {
     /// syscalls + per-record alloc/free into a single write per commit.
     pending: ArrayList(u8),
 
+    // === Group-commit fsync queue ===
+    //
+    // Writers do their `commitAppend` (records → kernel page cache via
+    // `pwritev`) under the data lock, then race here to fsync. The first
+    // arrival becomes the leader and issues one `fsync()` for the whole
+    // batch; followers wait on `sync_cv` and wake up with their commit
+    // already durable, paying zero syscalls.
+    //
+    // `last_flushed_lsn` is bumped after a successful `flush` in the
+    // pager's commitAppend. The leader snapshots it before fsyncing, and
+    // sets `fsynced_lsn` to that snapshot afterwards — every writer
+    // whose flush completed before the leader took the snapshot is then
+    // covered by the leader's syscall.
+    sync_mu: Io.Mutex,
+    sync_cv: Io.Condition,
+    leader_active: bool,
+    /// Highest LSN known durable on disk. Protected by `sync_mu`.
+    fsynced_lsn: u64,
+    /// Highest LSN whose `pwritev` has returned. Bumped post-flush by the
+    /// pager (under the data lock) and read by the fsync leader (under
+    /// `sync_mu`). Atomic so the cross-mutex visibility is well-defined.
+    last_flushed_lsn: std.atomic.Value(u64),
+
     pub fn open(allocator: Allocator, io: Io, dir: Dir, sub_path: []const u8) !Wal {
         const file = try dir.createFile(io, sub_path, .{
             .read = true,
@@ -87,7 +110,18 @@ pub const Wal = struct {
             mem.writeInt(u32, hdr[12..16], 4096, .little);
             try file.writePositionalAll(io, &hdr, 0);
             try file.sync(io);
-            return .{ .allocator = allocator, .io = io, .file = file, .end_offset = wal_header_size, .pending = .empty };
+            return .{
+                .allocator = allocator,
+                .io = io,
+                .file = file,
+                .end_offset = wal_header_size,
+                .pending = .empty,
+                .sync_mu = Io.Mutex.init,
+                .sync_cv = Io.Condition.init,
+                .leader_active = false,
+                .fsynced_lsn = 0,
+                .last_flushed_lsn = .init(0),
+            };
         }
         if (len < wal_header_size) return Error.TruncatedWal;
         var hdr: [wal_header_size]u8 = undefined;
@@ -95,7 +129,18 @@ pub const Wal = struct {
         if (n < wal_header_size) return Error.TruncatedWal;
         if (!mem.eql(u8, hdr[0..8], &wal_magic)) return Error.NotAWal;
         if (mem.readInt(u32, hdr[8..12], .little) != wal_version) return Error.UnsupportedWal;
-        return .{ .allocator = allocator, .io = io, .file = file, .end_offset = len, .pending = .empty };
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .file = file,
+            .end_offset = len,
+            .pending = .empty,
+            .sync_mu = Io.Mutex.init,
+            .sync_cv = Io.Condition.init,
+            .leader_active = false,
+            .fsynced_lsn = 0,
+            .last_flushed_lsn = .init(0),
+        };
     }
 
     pub fn close(self: *Wal) void {
@@ -193,14 +238,54 @@ pub const Wal = struct {
         try self.file.sync(self.io);
     }
 
-    /// fsync the WAL file without first flushing the staging buffer. Safe
-    /// to call from a thread that does NOT hold the writer's data lock,
-    /// provided the caller has guaranteed (via that lock) that every
-    /// record they need durable was already pushed to the kernel by an
-    /// earlier `flush()`. Used by the group-commit path: writers flush
-    /// under the lock, release the lock, then race here for the fsync.
-    pub fn fsync(self: *Wal) !void {
-        try self.file.sync(self.io);
+    /// Make every commit up to `my_lsn` durable on disk. Coalesces fsyncs
+    /// across concurrent writers via a leader/follower queue:
+    ///
+    ///   - First arrival becomes the leader, snapshots `last_flushed_lsn`,
+    ///     drops the queue mutex, calls one `fsync` for the whole batch,
+    ///     then advances `fsynced_lsn` and broadcasts.
+    ///   - Followers wait on `sync_cv`. When the leader broadcasts, each
+    ///     follower re-checks `fsynced_lsn` against its own `my_lsn`. If
+    ///     covered, it returns; otherwise it becomes the next leader.
+    ///
+    /// Safe to call from any thread without the data lock held. The data
+    /// lock guarantees that whatever this thread flushed is in the kernel
+    /// page cache before its `my_lsn` is observable here, so the leader's
+    /// `last_flushed_lsn` snapshot is correct when fsync is issued.
+    pub fn syncToLsn(self: *Wal, my_lsn: u64) !void {
+        self.sync_mu.lockUncancelable(self.io);
+        defer self.sync_mu.unlock(self.io);
+
+        while (self.fsynced_lsn < my_lsn) {
+            if (!self.leader_active) {
+                self.leader_active = true;
+                // Take the watermark BEFORE issuing fsync. fsync
+                // guarantees writes whose pwritev completed before this
+                // call are durable; anything later is unknown, so we
+                // intentionally don't credit followers whose flush races
+                // the syscall.
+                const watermark = self.last_flushed_lsn.load(.acquire);
+                self.sync_mu.unlock(self.io);
+
+                const sync_result = self.file.sync(self.io);
+
+                self.sync_mu.lockUncancelable(self.io);
+                self.leader_active = false;
+                if (sync_result) |_| {
+                    if (watermark > self.fsynced_lsn) self.fsynced_lsn = watermark;
+                    self.sync_cv.broadcast(self.io);
+                } else |err| {
+                    // Wake everyone so they can either retry as leader or
+                    // bubble the error out. Don't advance fsynced_lsn.
+                    self.sync_cv.broadcast(self.io);
+                    return err;
+                }
+                // Loop and re-check; if our my_lsn was past the leader's
+                // snapshot watermark, we'll become leader next iteration.
+            } else {
+                self.sync_cv.waitUncancelable(self.io, &self.sync_mu);
+            }
+        }
     }
 
     pub fn reset(self: *Wal) !void {
@@ -208,6 +293,17 @@ pub const Wal = struct {
         try self.file.setLength(self.io, wal_header_size);
         try self.file.sync(self.io);
         self.end_offset = wal_header_size;
+
+        // After reset, every record that was ever flushed is durable in
+        // the data file (checkpoint flushed page_cache + fsync'd before
+        // calling us). Advance the fsync watermark and wake any waiters
+        // so they don't issue a useless fsync against the now-truncated
+        // WAL.
+        self.sync_mu.lockUncancelable(self.io);
+        defer self.sync_mu.unlock(self.io);
+        const flushed = self.last_flushed_lsn.load(.acquire);
+        if (flushed > self.fsynced_lsn) self.fsynced_lsn = flushed;
+        self.sync_cv.broadcast(self.io);
     }
 
     /// Two-pass replay: pass 1 finds the offset of the last good COMMIT
