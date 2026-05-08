@@ -891,6 +891,7 @@ pub const OptimisticTxn = struct {
         find_one: FindOneEntry,
         find_all: FindAllEntry,
         find_range: FindRangeEntry,
+        iterator: IteratorEntry,
     };
 
     pub const FindOneEntry = struct {
@@ -917,6 +918,19 @@ pub const OptimisticTxn = struct {
         /// All doc_ids in [lo, hi] at snapshot time, in ascending index
         /// order. Owned by `arena`.
         matches: []const u64,
+    };
+
+    pub const IteratorEntry = struct {
+        coll: []const u8,                    // owned by `arena`
+        /// Doc_ids yielded so far, in the order the snapshot iterator
+        /// produced them. Grows lazily as the user iterates; partial if
+        /// they break early. Owned by the txn's main allocator (not the
+        /// arena) since we need `.append`.
+        matches: ArrayList(u64),
+        /// Set when the user iterated past the last entry — i.e. their
+        /// view "saw the end of the collection." Validation extends to
+        /// "no doc was appended after the observed tail."
+        exhausted: bool,
     };
 
     pub const WriteSetEntry = struct {
@@ -978,6 +992,17 @@ pub const OptimisticTxn = struct {
                     defer it.deinit();
                     if (!try liveMatchesEqual(&it, fr.matches)) return Error.WriteConflict;
                 },
+                .iterator => |ie| {
+                    var live = try self.db.collection(ie.coll).iterator(self.db.allocator);
+                    defer live.deinit();
+                    for (ie.matches.items) |expected_id| {
+                        const got = (try live.next()) orelse return Error.WriteConflict;
+                        if (got.id != expected_id) return Error.WriteConflict;
+                    }
+                    if (ie.exhausted) {
+                        if ((try live.next()) != null) return Error.WriteConflict;
+                    }
+                },
             }
         }
 
@@ -999,6 +1024,14 @@ pub const OptimisticTxn = struct {
     fn deinitAll(self: *OptimisticTxn) void {
         if (self.done) return;
         self.done = true;
+        // Iterator entries hold non-arena ArrayLists; free them before
+        // the arena tears down the rest.
+        for (self.range_set.items) |*entry| {
+            switch (entry.*) {
+                .iterator => |*it| it.matches.deinit(self.db.allocator),
+                else => {},
+            }
+        }
         self.read_set.deinit(self.db.allocator);
         self.write_set.deinit(self.db.allocator);
         self.range_set.deinit(self.db.allocator);
@@ -1111,6 +1144,38 @@ pub const OptimisticTxn = struct {
                 .matches = try arena_allocator.dupe(u64, matches),
             },
         });
+    }
+};
+
+/// Tracking iterator for `TxnCollection.iterator`. Wraps the
+/// snapshot's `Iterator` and appends each yielded doc_id to the
+/// txn's range_set so commit-time validation can detect phantoms.
+/// Calling `next()` past the last entry sets `exhausted = true` on
+/// the recorded entry, which extends validation to "no doc appended
+/// past the observed tail." If the caller breaks early, only the
+/// observed prefix is recorded — phantom inserts past the break
+/// point won't conflict (the user didn't depend on that range).
+pub const TxnIterator = struct {
+    inner: Iterator,
+    txn: *OptimisticTxn,
+    /// Index into `txn.range_set` of our `iterator` entry. Stable
+    /// across resizes — we re-index `range_set.items` on every call.
+    range_idx: usize,
+
+    pub fn deinit(self: *TxnIterator) void {
+        self.inner.deinit();
+    }
+
+    pub fn next(self: *TxnIterator) !?Iterator.Entry {
+        const e = (try self.inner.next()) orelse {
+            self.txn.range_set.items[self.range_idx].iterator.exhausted = true;
+            return null;
+        };
+        try self.txn.range_set.items[self.range_idx].iterator.matches.append(
+            self.txn.db.allocator,
+            e.id,
+        );
+        return e;
     }
 };
 
@@ -1244,9 +1309,22 @@ pub const TxnCollection = struct {
     // Range / indexed reads are phantom-prone in this version — they
     // pass through to the snapshot with no read-set tracking. A future
     // version will add range tracking.
-    pub fn iterator(self: TxnCollection, allocator: Allocator) !Iterator {
+    pub fn iterator(self: TxnCollection, allocator: Allocator) !TxnIterator {
         try validateName(self.name);
-        return self.txn.snapshot.collection(self.name).iterator(allocator);
+        const inner = try self.txn.snapshot.collection(self.name).iterator(allocator);
+        const arena_alloc = self.txn.arena.allocator();
+        try self.txn.range_set.append(self.txn.db.allocator, .{
+            .iterator = .{
+                .coll = try arena_alloc.dupe(u8, self.name),
+                .matches = .empty,
+                .exhausted = false,
+            },
+        });
+        return .{
+            .inner = inner,
+            .txn = self.txn,
+            .range_idx = self.txn.range_set.items.len - 1,
+        };
     }
 
     pub fn count(self: TxnCollection, allocator: Allocator) !u64 {
@@ -2650,4 +2728,97 @@ test "Db.runOptimistic: returns RetryBudgetExhausted when conflicts persist" {
     // Cap at 3 so the test stays fast (backoff caps at 10ms × 3 attempts).
     try testing.expectError(Error.RetryBudgetExhausted, db.runOptimistic(3, &ctx, Ctx.run));
     try testing.expectEqual(@as(u32, 3), attempts);
+}
+
+test "OptimisticTxn: iterator exhausted, concurrent insert appends → conflict" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-it-append.db");
+    defer db.close();
+
+    const a = try buildDoc("a", 1);
+    defer ally.free(a);
+    const b = try buildDoc("b", 2);
+    defer ally.free(b);
+    _ = try db.collection("c").insert(a);
+    _ = try db.collection("c").insert(b);
+    try db.checkpoint();
+
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    var it = try txn.collection("c").iterator(ally);
+    defer it.deinit();
+    var n: u32 = 0;
+    while (try it.next()) |_| n += 1;
+    try testing.expectEqual(@as(u32, 2), n);
+
+    // Concurrent committer appends a third doc.
+    const c = try buildDoc("c", 3);
+    defer ally.free(c);
+    _ = try db.collection("c").insert(c);
+
+    try testing.expectError(Error.WriteConflict, txn.commit());
+}
+
+test "OptimisticTxn: iterator early break — concurrent insert past break point does not conflict" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-it-break.db");
+    defer db.close();
+
+    var i: i64 = 0;
+    while (i < 5) : (i += 1) {
+        const d = try buildDoc("d", i);
+        defer ally.free(d);
+        _ = try db.collection("c").insert(d);
+    }
+    try db.checkpoint();
+
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    var it = try txn.collection("c").iterator(ally);
+    defer it.deinit();
+    // Read only the first two — break early.
+    _ = try it.next();
+    _ = try it.next();
+
+    // Concurrent committer appends a sixth doc — past our observed
+    // prefix, so the txn doesn't depend on it.
+    const x = try buildDoc("x", 99);
+    defer ally.free(x);
+    _ = try db.collection("c").insert(x);
+
+    try txn.commit();
+}
+
+test "OptimisticTxn: iterator + concurrent delete in observed prefix → conflict" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ally = testing.allocator;
+    var db = try Db.open(ally, testing.io, tmp.dir, "occ-it-del.db");
+    defer db.close();
+
+    const a = try buildDoc("a", 1);
+    defer ally.free(a);
+    const b = try buildDoc("b", 2);
+    defer ally.free(b);
+    const c = try buildDoc("c", 3);
+    defer ally.free(c);
+    const id_a = try db.collection("c").insert(a);
+    _ = try db.collection("c").insert(b);
+    _ = try db.collection("c").insert(c);
+    try db.checkpoint();
+
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    var it = try txn.collection("c").iterator(ally);
+    defer it.deinit();
+    while (try it.next()) |_| {}
+
+    // Concurrent committer deletes the first observed doc.
+    _ = try db.collection("c").delete(id_a);
+
+    try testing.expectError(Error.WriteConflict, txn.commit());
 }

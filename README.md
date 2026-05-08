@@ -301,11 +301,6 @@ try db.runOptimistic(8, Bump{ .target_id = 5 }, Bump.run);
 
 Caveats:
 
-- **`Collection.iterator` (full-collection scan) is still untracked
-  inside an OCC txn** — phantom inserts into the iterated set won't
-  conflict. Indexed range reads (`findOne`, `findAll`, `findRange`)
-  *are* tracked. If you need full-scan tracking, define an index and
-  use `findRange`.
 - **`runOptimistic` retries with exponential backoff + full jitter**
   (cap doubles from 100 µs up to 10 ms; sleep is uniformly random in
   `[0, cap)`). The randomness prevents synchronised retry storms when
@@ -328,6 +323,18 @@ modifies an existing match's indexed field so that it leaves the
 range, triggers `WriteConflict`. (`findAll`/`findRange` return a
 `TxnMatchIterator` over the captured slice instead of the
 `index_mod.RangeIterator` you'd get from a regular `Collection`.)
+
+`Collection.iterator` (unindexed full-collection scan) is also
+tracked: each yielded doc_id is appended to the txn's range_set as
+the user iterates, and validation walks the live collection to
+position-by-position confirm what was observed. If the iterator was
+exhausted (next returned null), validation additionally requires the
+live collection's tail to be empty past the observed prefix —
+catching phantom appends. If the user breaks early, only the
+observed prefix is conflict-checked; phantom inserts past that point
+are correctly ignored. The OCC iterator returns the same
+`Iterator.Entry { id, doc }` shape as a regular `Collection` so
+existing iteration code ports unchanged.
 
 ### Pessimistic-write ceiling
 
@@ -545,9 +552,9 @@ Python tests live under `bindings/python/tests/` and are run with
       lock-free snapshot reads, buffered writes, conflict detection at
       commit. Lost-update protection for blind writes via implicit
       snapshot read on `put`/`delete`. Phantom protection for indexed
-      reads (`findOne` / `findAll` / `findRange`) via match-list
-      replay at validation. `runOptimistic` retries with exponential
-      backoff + full jitter. Full-scan `iterator` tracking still TODO.
+      reads (`findOne` / `findAll` / `findRange`) and full-scan
+      `iterator` via match-list replay at validation.
+      `runOptimistic` retries with exponential backoff + full jitter.
 - [ ] Concurrent B+Tree mutations (per-page locks, keyspace sharding,
       or LSM) — break past the `db.mu` ceiling for `.full`-mode
       auto-commit throughput.
