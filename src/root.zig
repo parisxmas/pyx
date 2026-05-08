@@ -9,6 +9,7 @@ pub const doc = @import("doc.zig");
 pub const json = @import("json.zig");
 pub const index = @import("index.zig");
 pub const shm = @import("shm.zig");
+pub const flock = @import("flock.zig");
 pub const db = @import("db.zig");
 pub const Pager = pager.Pager;
 pub const PageId = pager.PageId;
@@ -25,5 +26,6 @@ test {
     _ = json;
     _ = index;
     _ = shm;
+    _ = flock;
     _ = db;
 }

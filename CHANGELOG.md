@@ -13,6 +13,12 @@ tag goes under `## Unreleased`.
   Layout reserves 4 KB for cross-process state (magic, version,
   shared atomic counters); `next_doc_id` is the first counter moved
   into shm.
+- Multi-process foundation, phase 1C (in progress): `src/flock.zig`
+  introduces a thin POSIX byte-range advisory-lock wrapper around
+  `fcntl(F_SETLK / F_SETLKW)` — `lock` (blocking), `tryLock`
+  (non-blocking → bool), `unlock`. Module ships standalone with
+  self-tests; the Pager-side wiring (WRITER lock around commit,
+  RECOVERY lock for first-opener seed) is the next step.
 - Multi-process foundation, phase 1B: the remaining three runtime
   counters move to shm — `num_pages`, `next_lsn`, and
   `wal.end_offset`. `Wal.open` takes the shm-resident
