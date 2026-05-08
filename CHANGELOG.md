@@ -45,11 +45,17 @@ tag goes under `## Unreleased`.
 ### Changed
 - README benchmark tables refreshed against latest runs (twice in
   this cycle); shape unchanged within run-to-run variance.
+- README Zig and C quick-starts now include OCC examples (the
+  Python one already had `run_optimistic`).
 - README Python quick-start showcases the new `find_range`
   ergonomics and includes an OCC `run_optimistic` example.
 - README concurrency-model section now describes phantom protection
   semantics in detail and the `TxnMatchIterator`/`TxnIterator` API
   shape.
+- bindings/python/README updated: optimistic-transactions section,
+  three styles of `find_range`, accurate concurrency note (OCC reads
+  are lock-free).
+- README project layout adds `CHANGELOG.md`.
 
 ## 0.2.0 — 2026-05-08
 

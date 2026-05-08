@@ -37,10 +37,12 @@ with pyx.Db.open("mydb.pyx") as db:
     db.create_index("users", "age")
     print(users.find_one("age", 30))         # uid
 
-    for doc_id in users.find_range("age",
-                                   pyx.Bound.inclusive(18),
-                                   pyx.Bound.exclusive(65)):
-        print(doc_id, users.get(doc_id))
+    # Range scan — three equivalent calling styles:
+    list(users.find_range("age", 18, 65))                  # bare scalars (inclusive)
+    list(users.find_range("age", gte=18, lt=65))           # SQL-style kwargs
+    list(users.find_range("age",                           # explicit Bound (mixable)
+                          pyx.Bound.inclusive(18),
+                          pyx.Bound.exclusive(65)))
 
     with db.snapshot() as snap:
         snap_users = snap.collection("users")
@@ -48,7 +50,7 @@ with pyx.Db.open("mydb.pyx") as db:
             print(doc_id, doc)
 ```
 
-## Transactions
+## Transactions (pessimistic — holds the data lock)
 
 ```python
 with db.transaction():
@@ -57,11 +59,40 @@ with db.transaction():
 # commits on normal exit, aborts on exception.
 ```
 
+## Optimistic transactions
+
+Lock-free reads, conflict-checked at commit, auto-retry with
+exponential backoff + full jitter. Use this when multiple writer
+threads need to overlap their read-and-then-write phases.
+
+```python
+def transfer(txn):
+    accounts = txn.collection("accounts")
+    src = accounts.get(src_id)
+    dst = accounts.get(dst_id)
+    accounts.put(src_id, {**src, "balance": src["balance"] - amount})
+    accounts.put(dst_id, {**dst, "balance": dst["balance"] + amount})
+
+db.run_optimistic(transfer)               # retries on WriteConflict
+
+# Or manually:
+with db.begin_optimistic() as txn:
+    tc = txn.collection("c")
+    cur = tc.get(5)
+    tc.put(5, {**cur, "n": cur["n"] + 1})
+    txn.commit()                          # raises WriteConflict on a race
+```
+
+`run_optimistic(fn, max_attempts=8)` retries on `pyx.WriteConflict`
+until success or `pyx.RetryBudgetExhausted`. Backoff cap doubles
+from 100 µs up to 10 ms; sleep is uniformly random in `[0, cap)`.
+
 ## Notes
 
 - Python ints are encoded as i64; values outside the i64 range raise
   `ValueError`. Use floats for larger numbers.
 - Indexed lookup values can be `None`, `bool`, `int`, `float`, or `str`.
-- `Snapshot` reads are lock-free and safe to share across threads. The
-  underlying `Db` is single-writer; serialize writes yourself if you call
-  from multiple threads.
+- `Snapshot` reads and OCC reads are lock-free and safe to share
+  across threads. Pessimistic writes (`Collection.put` etc.) serialize
+  on an internal mutex; OCC writes overlap their read+work phase and
+  serialize only at commit.

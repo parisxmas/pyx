@@ -135,6 +135,14 @@ pub fn main() !void {
     while (try it.next()) |entry| {
         std.debug.print("{d}: {} bytes\n", .{ entry.id, entry.doc.len });
     }
+
+    // Optimistic transaction (lock-free reads, conflict-checked at commit).
+    var txn = try db.beginOptimistic();
+    errdefer txn.abort();
+    const tu = txn.collection("users");
+    if (try tu.get(ally, id)) |buf| ally.free(buf);
+    try tu.put(id, bytes); // buffered until commit
+    try txn.commit();      // returns error.WriteConflict on a race
 }
 ```
 
@@ -159,6 +167,20 @@ pyx_snapshot *snap = NULL;
 pyx_snapshot_open(db, &snap);
 /* ... lock-free reads from any thread ... */
 pyx_snapshot_close(snap);
+
+/* Optimistic transaction with manual retry on PYX_WRITE_CONFLICT. */
+for (;;) {
+    pyx_optimistic_txn *txn = NULL;
+    if (pyx_begin_optimistic(db, &txn) != PYX_OK) abort();
+    pyx_buf got = {0};
+    pyx_optimistic_get(txn, "users", 5, id, &got);
+    pyx_buf_free(&got);
+    pyx_optimistic_put(txn, "users", 5, id, doc_bytes, doc_len);
+    pyx_status s = pyx_optimistic_commit(txn);
+    if (s == PYX_OK) break;
+    if (s != PYX_WRITE_CONFLICT) abort();
+    /* fall through to retry */
+}
 
 pyx_close(db);
 ```
@@ -539,6 +561,7 @@ bindings/python/    ctypes-based Python wrapper
   pyproject.toml    PEP 517 build config
 
 build.zig           build graph (lib, exe, tests, benches)
+CHANGELOG.md        release notes (Keep a Changelog format)
 ```
 
 ---
