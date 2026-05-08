@@ -7,6 +7,30 @@ tag goes under `## Unreleased`.
 
 ## Unreleased
 
+## 0.4.0 — 2026-05-08
+
+The headline of 0.4.0 is **keyspace sharding** — opt-in, per-name
+isolated B+Trees in a single `.pyx` file. Calling
+`db.create_collection("foo")` allocates a fresh `CollectionId`,
+persists a `name → id` mapping in the on-disk catalog, and from
+that point on `db.collection("foo")` reads and writes through
+its own tree, isolated from every other collection.
+
+The infrastructure is the load-bearing piece: `CollectionId`
+threaded through every layer (pager → WAL → btree → catalog →
+snapshot), per-collection roots in shm + on-disk header v2,
+WAL V2 records carrying a `collection_id` per put/delete,
+snapshot capturing all in-use roots atomically, and a catalog
+cache that survives close/reopen + a fully-wiped shm.
+
+The throughput payoff — per-collection writer locks so N
+writers across N collections can commit in parallel — is
+**not in 0.4.0**; that's phase 3, deferred to 0.5.0. Every
+commit still serialises on the global single-writer protocol
+that 0.3.0 shipped (one machine-wide WRITER fcntl + one
+in-process `db.mu`). Expect 0.4.0's write throughput to match
+0.3.0's; the win is feature scope, not commits/s.
+
 ### Added
 - Keyspace sharding, phase 2C: the user-facing API. Calling
   `db.create_collection("foo")` (Python) / `db.createCollection("foo")`
@@ -356,6 +380,7 @@ First tagged release.
   `applyAndFinalize`. `db.zig` writes release `db.mu` between
   apply and fsync, enabling group-commit coalescing.
 
-[Unreleased]: https://github.com/parisxmas/pyx/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/parisxmas/pyx/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/parisxmas/pyx/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/parisxmas/pyx/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/parisxmas/pyx/releases/tag/v0.2.0
