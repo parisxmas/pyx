@@ -184,13 +184,24 @@ pub const Pager = struct {
         });
         errdefer file.close(io);
 
-        const file_len = try file.length(io);
-        const fresh = file_len == 0;
-
         const wal_path = try mem.concat(allocator, u8, &.{ sub_path, ".wal" });
         defer allocator.free(wal_path);
         const shm_path = try mem.concat(allocator, u8, &.{ sub_path, "-shm" });
         defer allocator.free(shm_path);
+
+        // Take RECOVERY EXCL (blocking) for the duration of open. This
+        // serialises every opener system-wide so the fresh-init path
+        // (writing the header, deleting stale wal/shm) runs at most
+        // once even when N processes start simultaneously. Once we
+        // finish open we downgrade to SHARED for the lifetime of the
+        // handle.
+        try flock_mod.lock(file.handle, .write, recovery_lock_region);
+        // The downgrade at end of open will release the EXCL hold; if
+        // we error out before then, drop EXCL on close.
+        errdefer flock_mod.unlock(file.handle, recovery_lock_region) catch {};
+
+        const file_len = try file.length(io);
+        const fresh = file_len == 0;
 
         if (fresh) {
             var hbuf: [page_size]u8 = undefined;
@@ -211,17 +222,15 @@ pub const Pager = struct {
         var shm = try shm_mod.Shm.open(io, dir, shm_path);
         errdefer shm.close();
 
-        // Phase 1C: gate shm seeding on the RECOVERY fcntl lock. Try
-        // an exclusive non-blocking lock on the RECOVERY byte — if we
-        // get it, no other process has the DB open, so seeding the
-        // shm atomics from the on-disk header is safe. If we don't,
-        // someone else is already running and the shm has live state
-        // we must not clobber. Either way, downgrade to a shared lock
-        // for the lifetime of this open so future openers can detect
-        // us. Closing the file fd releases all our advisory locks
-        // automatically (per-process POSIX semantics).
-        const got_excl = flock_mod.tryLock(file.handle, .write, recovery_lock_region) catch false;
-        if (got_excl) {
+        // Holding RECOVERY EXCL — we know no other process can be
+        // mid-open. If shm magic was just freshly initialised (`shm.fresh`)
+        // OR the magic existed but the live atomics happen to be zeroed
+        // (e.g. crash recovery against a stale shm that had been
+        // written to disk), seed from the on-disk header. The
+        // alternative case — shm has live values from a still-running
+        // peer — can't happen here because peers hold SHARED on
+        // RECOVERY, which conflicts with our EXCL acquisition.
+        if (shm.fresh or shm.btreeRoot().load(.acquire) == 0) {
             shm.seedFromHeader(
                 header.next_doc_id,
                 header.num_pages,
@@ -229,13 +238,14 @@ pub const Pager = struct {
                 @intCast(header.btree_root),
             );
         }
-        // Replace our (write or no) lock with shared. If the prior
-        // attempt succeeded, this downgrades exclusive→shared; if it
-        // failed, this takes shared from scratch.
-        flock_mod.lock(file.handle, .read, recovery_lock_region) catch {};
 
         var wal = try wal_mod.Wal.open(allocator, io, dir, wal_path, shm.walEndOffset());
         errdefer wal.close();
+
+        // Downgrade RECOVERY EXCL → SHARED for the lifetime of this
+        // handle. Other openers can now proceed (and also take
+        // SHARED). Closing the file fd later will release the lock.
+        flock_mod.lock(file.handle, .read, recovery_lock_region) catch {};
 
         return .{
             .allocator = allocator,

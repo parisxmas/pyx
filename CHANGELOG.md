@@ -44,16 +44,18 @@ tag goes under `## Unreleased`.
   - `Pager.checkpoint` now also takes the WRITER lock so it can't
     truncate the WAL during a concurrent committer's append.
   - Verified: two processes each inserting 200 docs into the same
-    DB → 400 docs preserved, byte-identical to single-process. The
-    Django example would now be safe under `--workers 1 --threads N`
-    on multiple gunicorn instances backing a load balancer (the
-    earlier-stated limitation no longer applies for that pattern).
-  - Known residual: 4-process simultaneous open from a fresh DB
-    has a flaky `InvalidPageId` once in a while — likely a race in
-    the open/seed path under heavy concurrent first-opener
-    contention. Two-process and serial-open scenarios are clean.
-    Investigation continues; for now the README's
-    single-process advice still applies for ≥4 concurrent openers.
+    DB → 400 docs preserved, byte-identical to single-process.
+- Multi-process foundation, phase 2C: fix the open-path race that
+  was causing flaky `InvalidPageId` under 4+ concurrent first
+  openers. Root cause: every fresh-init candidate (file_len == 0)
+  raced to delete `.wal`/`.pyx-shm` and write the header, clobbering
+  a process that had already moved on. Fix: take RECOVERY EXCL
+  blocking at the start of `Pager.open`, do the fresh-init under
+  it, downgrade to SHARED for the lifetime of the handle. SQLite
+  uses essentially the same DMS pattern. New verification: 8
+  processes × 100 inserts × 3 trials → 800 docs preserved every
+  time, no errors. The Django example's "single-process only"
+  caveat is now obsolete for the open-and-write pattern.
 - Multi-process foundation, phase 1C: `src/flock.zig` POSIX byte-
   range advisory-lock wrapper, plus the Pager-side wiring:
   - WRITER lock (byte 0 of the data file) around `pager.begin` →
