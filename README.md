@@ -265,6 +265,79 @@ not parallelise. Multi-writer is a v1 work item.
 
 ---
 
+## Benchmarks vs SQLite
+
+Numbers below are from the bundled benchmark harnesses
+(`src/bench*.zig`) compiled with `-Doptimize=ReleaseFast`. Both engines
+use the same workload, document size, and durability setting; pyx is in
+its `normal` sync mode (fsync at checkpoint) and SQLite is in
+`journal_mode=WAL, synchronous=NORMAL` — the apples-to-apples baseline.
+SQLite's default rollback-journal numbers are included for reference.
+
+**Test environment:** Apple M4 (10 cores), 24 GB RAM, macOS 26.3,
+APFS on internal SSD, Zig 0.16.0, SQLite 3.53.0 (Homebrew).
+
+### Single-thread microbench — 10 000 ops
+
+| Operation               | pyx (normal) | SQLite WAL+NORMAL | SQLite default | pyx vs WAL |
+|-------------------------|-------------:|------------------:|---------------:|-----------:|
+| insert (auto-commit)    | **261 k/s**  | 115 k/s           |  5.5 k/s       | **2.3×**   |
+| insert (batched in txn) | **4.01 M/s** | 3.30 M/s          |  2.84 M/s      | **1.2×**   |
+| random `get` by id      | **3.10 M/s** | 1.27 M/s          |  357 k/s       | **2.4×**   |
+| full collection iterate | **233 M docs/s** | 32 M docs/s    |  32 M docs/s   | **7.3×**   |
+| indexed `findOne`       | **1.40 M/s** | 1.24 M/s          |  357 k/s       | **1.1×**   |
+
+`zig build bench` / `zig build bench-sqlite` to reproduce.
+
+### Concurrent — 100 k preloaded docs, 3 s per phase
+
+**Read-only** (each reader holds a snapshot; 75 % random `get`, 25 %
+indexed point query):
+
+| Threads | pyx aggregate | SQLite WAL aggregate | pyx advantage |
+|---------|--------------:|---------------------:|--------------:|
+| 1       | 1.40 M ops/s  | 716 k ops/s          | 1.9×          |
+| 2       | 2.75 M ops/s  | 1.02 M ops/s         | 2.7×          |
+| 4       | 5.40 M ops/s  | 849 k ops/s          | 6.4×          |
+| 8       | **7.69 M ops/s** | 328 k ops/s        | **23×**       |
+
+pyx scales near-linearly because snapshot reads are lock-free and
+mmap-backed. SQLite's WAL reader path serialises on the wal-index
+shared-memory mutex, so read throughput peaks at two threads and
+degrades past four.
+
+**1 writer + N readers** (writer does 100-doc batched inserts):
+
+| Phase    | pyx writer        | pyx readers   | SQLite writer | SQLite readers |
+|----------|------------------:|--------------:|--------------:|---------------:|
+| 1w + 1r  | 624 k inserts/s   | 884 k ops/s   | 660 k inserts/s | 613 k ops/s  |
+| 1w + 2r  | 312 k inserts/s   | 2.61 M ops/s  | 353 k inserts/s | 661 k ops/s  |
+| 1w + 4r  | 271 k inserts/s   | 4.07 M ops/s  | 147 k inserts/s | 564 k ops/s  |
+| 1w + 8r  | **243 k inserts/s** | **5.40 M ops/s** | **44 k inserts/s** | **332 k ops/s** |
+
+Under concurrent read pressure, pyx's writer holds steady around
+240 k inserts/s while SQLite's collapses to 44 k. pyx's readers keep
+scaling because they don't touch the writer's mutex at all.
+
+`zig build bench-concurrent` / `zig build bench-concurrent-sqlite` to
+reproduce.
+
+### Caveats
+
+- These are microbenchmarks. The workload is small documents (~30 B
+  each) and a single collection — useful for comparing engine cost,
+  not for projecting application performance.
+- macOS APFS `fsync` semantics differ from Linux `ext4`/`xfs`; absolute
+  numbers will move on Linux, but the relative shape (lock-free
+  snapshot reads vs WAL-index contention) is the same.
+- pyx is single-writer; SQLite is also effectively single-writer in
+  WAL mode. The 1w+Nr numbers measure that case fairly. Multi-writer
+  is not yet implemented in pyx.
+- The auto-commit insert path fsyncs less often in `normal` mode,
+  matching SQLite's `synchronous=NORMAL`. With pyx's default
+  `full` mode (fsync per commit), auto-commit insert drops by roughly
+  4–6× — comparable to SQLite default rollback-journal mode.
+
 ## Project layout
 
 ```
