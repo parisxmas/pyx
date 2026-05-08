@@ -20,6 +20,11 @@ tag goes under `## Unreleased`.
   `(user_id, tag)`, and the single-process deployment constraint.
   Includes README, settings, views, templates, and an editable
   `requirements.txt` that wires up the local Python binding.
+  Verified end-to-end against `runserver`: empty list → create →
+  list → detail → edit (OCC commit lands) → tag filter → delete →
+  404. The template-language constraint that variable names can't
+  start with `_` led to renaming the dict's `_id` key to `doc_id`
+  in views and templates.
 - Multi-process foundation, phase 1C (in progress): `src/flock.zig`
   introduces a thin POSIX byte-range advisory-lock wrapper around
   `fcntl(F_SETLK / F_SETLKW)` — `lock` (blocking), `tryLock`

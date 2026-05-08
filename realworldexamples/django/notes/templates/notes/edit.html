@@ -2,7 +2,7 @@
 {% block title %}Edit — {{ note.title }}{% endblock %}
 {% block content %}
 <h1>Edit {{ note.title }}</h1>
-<form method="post" action="{% url 'notes:edit' note._id %}">
+<form method="post" action="{% url 'notes:edit' note.doc_id %}">
     <input type="hidden" name="u" value="{{ request.GET.u|default:'demo' }}">
     <input type="text" name="title" value="{{ note.title }}" required>
     <textarea name="body" rows="8">{{ note.body }}</textarea>
@@ -13,6 +13,6 @@
         on conflict.
     </p>
     <button type="submit">Save</button>
-    <a href="{% url 'notes:detail' note._id %}?u={{ request.GET.u|default:'demo' }}">Cancel</a>
+    <a href="{% url 'notes:detail' note.doc_id %}?u={{ request.GET.u|default:'demo' }}">Cancel</a>
 </form>
 {% endblock %}

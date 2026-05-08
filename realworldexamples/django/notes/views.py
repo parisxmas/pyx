@@ -80,13 +80,13 @@ def list_view(request):
                     continue
                 if tag not in (doc.get("tags") or []):
                     continue
-                doc["_id"] = doc_id
+                doc["doc_id"] = doc_id
                 notes_out.append(doc)
         else:
             for doc_id, doc in c:
                 if doc.get("user_id") != user_id:
                     continue
-                doc["_id"] = doc_id
+                doc["doc_id"] = doc_id
                 notes_out.append(doc)
 
     notes_out.sort(key=lambda d: d.get("updated_at", ""), reverse=True)
@@ -130,7 +130,7 @@ def detail_view(request, doc_id: int):
     note = db.collection("notes").get(doc_id)
     if note is None:
         return HttpResponseNotFound("note not found")
-    note["_id"] = doc_id
+    note["doc_id"] = doc_id
     return render(request, "notes/detail.html", {"note": note})
 
 
@@ -157,7 +157,7 @@ def edit_view(request, doc_id: int):
         note = coll.get(doc_id)
         if note is None:
             return HttpResponseNotFound("note not found")
-        note["_id"] = doc_id
+        note["doc_id"] = doc_id
         return render(request, "notes/edit.html", {"note": note})
 
     title = request.POST.get("title", "").strip()

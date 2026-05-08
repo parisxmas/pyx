@@ -20,7 +20,7 @@
 
 {% for n in notes %}
     <article class="note">
-        <h3><a href="{% url 'notes:detail' n._id %}?u={{ user_id }}">{{ n.title }}</a></h3>
+        <h3><a href="{% url 'notes:detail' n.doc_id %}?u={{ user_id }}">{{ n.title }}</a></h3>
         <p>{{ n.body|truncatewords:25 }}</p>
         <p>
             {% for t in n.tags %}
