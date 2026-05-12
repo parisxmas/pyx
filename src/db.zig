@@ -220,7 +220,13 @@ pub const Db = struct {
     pub fn open(allocator: Allocator, io: Io, dir: Dir, sub_path: []const u8) !Db {
         var pager = try pager_mod.Pager.open(allocator, io, dir, sub_path);
         errdefer pager.close();
+        // Pager.open hands us byte 0 EXCL still held; we release it
+        // here, after replayWal finishes. While EXCL is held, peer
+        // committers in other processes block on their byte-0-SHARED
+        // acquisition (see Pager.begin), so their commits can't race
+        // our replay.
         try replayWal(allocator, &pager);
+        pager.finishOpen();
 
         var collections: std.StringHashMapUnmanaged(pager_mod.CollectionId) = .empty;
         errdefer freeCollectionsCache(allocator, &collections);
