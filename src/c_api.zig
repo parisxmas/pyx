@@ -415,6 +415,70 @@ export fn pyx_get(
     return status_not_found;
 }
 
+/// Caller-allocated single-doc get (phase 7) — collapses the two-call
+/// `pyx_get` + `pyx_buf_free` round-trip into one. Returns:
+///   - `ok`               and `*out_len = bytes_written` on hit
+///   - `not_found`        and `*out_len = 0` on miss
+///   - `buffer_too_small` and `*out_len = required_size` if `out_buf_cap`
+///     is smaller than the value — caller should retry with a buffer of
+///     at least that size.
+/// The Python C extension calls this directly via a function pointer, so
+/// the binding's get path avoids ctypes entirely.
+export fn pyx_get_zero_copy(
+    db: ?*State,
+    coll: ?[*]const u8, coll_len: usize,
+    doc_id: u64,
+    out_buf: ?[*]u8, out_buf_cap: usize,
+    out_len: ?*usize,
+) c_int {
+    const s = db orelse return status_invalid_arg;
+    const c = nameSliceFromCArg(coll, coll_len) orelse return status_invalid_arg;
+    const lenp = out_len orelse return status_invalid_arg;
+    lenp.* = 0;
+    // out_buf may legitimately be null when out_buf_cap == 0 — we still
+    // need to be able to report the required size for the too-small path.
+    const out_slice: []u8 = if (out_buf_cap == 0)
+        &[_]u8{}
+    else
+        (out_buf orelse return status_invalid_arg)[0..out_buf_cap];
+
+    const found = s.db.collection(c).getInto(doc_id, out_slice, lenp) catch |err| switch (err) {
+        error.BufferTooSmall => return status_buffer_too_small,
+        else => {
+            setLastError("pyx_get_zero_copy: {t}", .{err});
+            return statusFromError(err);
+        },
+    };
+    return if (found) status_ok else status_not_found;
+}
+
+/// Snapshot variant of `pyx_get_zero_copy`. Same semantics.
+export fn pyx_snapshot_get_zero_copy(
+    snap: ?*SnapshotState,
+    coll: ?[*]const u8, coll_len: usize,
+    doc_id: u64,
+    out_buf: ?[*]u8, out_buf_cap: usize,
+    out_len: ?*usize,
+) c_int {
+    const ss = snap orelse return status_invalid_arg;
+    const c = nameSliceFromCArg(coll, coll_len) orelse return status_invalid_arg;
+    const lenp = out_len orelse return status_invalid_arg;
+    lenp.* = 0;
+    const out_slice: []u8 = if (out_buf_cap == 0)
+        &[_]u8{}
+    else
+        (out_buf orelse return status_invalid_arg)[0..out_buf_cap];
+
+    const found = ss.snapshot.collection(c).getInto(doc_id, out_slice, lenp) catch |err| switch (err) {
+        error.BufferTooSmall => return status_buffer_too_small,
+        else => {
+            setLastError("pyx_snapshot_get_zero_copy: {t}", .{err});
+            return statusFromError(err);
+        },
+    };
+    return if (found) status_ok else status_not_found;
+}
+
 /// Batched get (phase 4) — collapses N point reads into one C call so
 /// Python callers don't pay the per-call ctypes overhead per id. Layout:
 ///

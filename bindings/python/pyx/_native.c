@@ -227,6 +227,156 @@ static PyObject *read_payload(Reader *r, uint8_t tag) {
     }
 }
 
+/* ============================================================
+ * Bound C ABI function pointers (phase 7) — Python passes the
+ * libpyx symbol addresses in via `bind`, and the native single-id
+ * get path calls them directly. This skips the ctypes layer for
+ * the hottest single-doc-read path entirely.
+ *
+ * Status code values mirror the C enum in c_api.zig (see
+ * `_ffi.py`). Stored here as a duplicate so we don't have to
+ * pull anything in from the Python side at call time.
+ * ============================================================ */
+
+#define PYX_STATUS_OK                 0
+#define PYX_STATUS_NOT_FOUND          1
+#define PYX_STATUS_BUFFER_TOO_SMALL  -14
+
+typedef int (*pyx_get_zero_copy_fn)(
+    void *db,
+    const char *coll, size_t coll_len,
+    uint64_t doc_id,
+    uint8_t *out_buf, size_t out_buf_cap,
+    size_t *out_len);
+
+typedef const char *(*pyx_last_error_fn)(void);
+
+static pyx_get_zero_copy_fn g_pyx_get_zero_copy = NULL;
+static pyx_get_zero_copy_fn g_pyx_snapshot_get_zero_copy = NULL;
+static pyx_last_error_fn g_pyx_last_error = NULL;
+
+/* bind(get_zero_copy_addr, snapshot_get_zero_copy_addr, last_error_addr)
+ * — three C function pointers passed as Python ints. Called once from
+ * Python at import time. */
+static PyObject *py_bind(PyObject *self, PyObject *args) {
+    (void)self;
+    unsigned long long get_addr = 0, snap_addr = 0, err_addr = 0;
+    if (!PyArg_ParseTuple(args, "KKK", &get_addr, &snap_addr, &err_addr)) {
+        return NULL;
+    }
+    g_pyx_get_zero_copy = (pyx_get_zero_copy_fn)(uintptr_t)get_addr;
+    g_pyx_snapshot_get_zero_copy = (pyx_get_zero_copy_fn)(uintptr_t)snap_addr;
+    g_pyx_last_error = (pyx_last_error_fn)(uintptr_t)err_addr;
+    Py_RETURN_NONE;
+}
+
+/* Call one of the bound `*_get_zero_copy` entry points with auto-retry
+ * on BUFFER_TOO_SMALL, decoding the value into a Python dict on hit.
+ * Returns:
+ *   - new dict reference on hit
+ *   - Py_None (new ref) on miss
+ *   - NULL with PyErr set on internal error
+ */
+static PyObject *call_get_and_decode(
+    pyx_get_zero_copy_fn fn,
+    void *db_or_snap,
+    const char *coll, Py_ssize_t coll_len,
+    uint64_t doc_id
+) {
+    /* 4 KiB on-stack scratch — covers the vast majority of pyx docs
+     * (the format's page-payload-cap is around the page size). Larger
+     * docs fall back to a malloc'd buffer sized to `out_len`. */
+    uint8_t stack_buf[4096];
+    uint8_t *buf = stack_buf;
+    size_t cap = sizeof(stack_buf);
+    uint8_t *heap_buf = NULL;
+    size_t out_len = 0;
+
+    int rc = fn(db_or_snap, coll, (size_t)coll_len, doc_id, buf, cap, &out_len);
+    if (rc == PYX_STATUS_BUFFER_TOO_SMALL) {
+        heap_buf = (uint8_t *)PyMem_Malloc(out_len);
+        if (!heap_buf) {
+            PyErr_NoMemory();
+            return NULL;
+        }
+        rc = fn(db_or_snap, coll, (size_t)coll_len, doc_id, heap_buf, out_len, &out_len);
+        buf = heap_buf;
+    }
+
+    if (rc == PYX_STATUS_NOT_FOUND) {
+        PyMem_Free(heap_buf);
+        Py_RETURN_NONE;
+    }
+    if (rc != PYX_STATUS_OK) {
+        const char *msg = g_pyx_last_error ? g_pyx_last_error() : "pyx_get_zero_copy failed";
+        PyErr_Format(PyExc_RuntimeError, "pyx_get_zero_copy: rc=%d: %s", rc, msg);
+        PyMem_Free(heap_buf);
+        return NULL;
+    }
+
+    Reader r = { .buf = buf, .pos = 0, .end = (Py_ssize_t)out_len };
+    PyObject *result = read_value(&r);
+    PyMem_Free(heap_buf);
+    return result;
+}
+
+/* get(db_ptr_int, coll_bytes, doc_id) -> dict | None.
+ *
+ * `db_ptr_int`  : opaque libpyx State*, passed as a Python int (caller
+ *                 typically uses `db._handle.value` from ctypes).
+ * `coll_bytes`  : already-encoded UTF-8 collection name (bytes).
+ * `doc_id`      : u64 doc id.
+ *
+ * Calls `pyx_get_zero_copy` directly via the bound function pointer,
+ * decodes the returned bytes in C, and hands back a finished Python
+ * dict — no ctypes round-trip and no separate `pyx_buf_free` call. */
+static PyObject *py_get(PyObject *self, PyObject *args) {
+    (void)self;
+    unsigned long long db_int;
+    Py_buffer coll_view;
+    unsigned long long doc_id;
+    if (!PyArg_ParseTuple(args, "Ky*K", &db_int, &coll_view, &doc_id)) {
+        return NULL;
+    }
+    if (!g_pyx_get_zero_copy) {
+        PyBuffer_Release(&coll_view);
+        PyErr_SetString(PyExc_RuntimeError,
+            "pyx._native.get called before bind()");
+        return NULL;
+    }
+    PyObject *result = call_get_and_decode(
+        g_pyx_get_zero_copy,
+        (void *)(uintptr_t)db_int,
+        (const char *)coll_view.buf, coll_view.len,
+        (uint64_t)doc_id);
+    PyBuffer_Release(&coll_view);
+    return result;
+}
+
+/* snapshot_get(snap_ptr_int, coll_bytes, doc_id) -> dict | None. */
+static PyObject *py_snapshot_get(PyObject *self, PyObject *args) {
+    (void)self;
+    unsigned long long snap_int;
+    Py_buffer coll_view;
+    unsigned long long doc_id;
+    if (!PyArg_ParseTuple(args, "Ky*K", &snap_int, &coll_view, &doc_id)) {
+        return NULL;
+    }
+    if (!g_pyx_snapshot_get_zero_copy) {
+        PyBuffer_Release(&coll_view);
+        PyErr_SetString(PyExc_RuntimeError,
+            "pyx._native.snapshot_get called before bind()");
+        return NULL;
+    }
+    PyObject *result = call_get_and_decode(
+        g_pyx_snapshot_get_zero_copy,
+        (void *)(uintptr_t)snap_int,
+        (const char *)coll_view.buf, coll_view.len,
+        (uint64_t)doc_id);
+    PyBuffer_Release(&coll_view);
+    return result;
+}
+
 /* decode(buf) — `buf` must support the buffer protocol (bytes, bytearray,
  * memoryview, ctypes array, …). Returns the decoded object (a dict for
  * top-level pyx documents). */
@@ -643,6 +793,15 @@ static PyMethodDef NativeMethods[] = {
     {"encode_many", py_encode_many, METH_O,
      "encode_many(docs) -> (bytes, list[int]). "
      "Encode N dicts into one packed buffer + a per-doc length list."},
+    {"bind", py_bind, METH_VARARGS,
+     "bind(get_zero_copy_addr, snap_get_zero_copy_addr, last_error_addr). "
+     "Install libpyx function pointers for the native get path."},
+    {"get", py_get, METH_VARARGS,
+     "get(db_ptr_int, coll_bytes, doc_id) -> dict | None. "
+     "Native single-doc lookup; calls libpyx directly, no ctypes layer."},
+    {"snapshot_get", py_snapshot_get, METH_VARARGS,
+     "snapshot_get(snap_ptr_int, coll_bytes, doc_id) -> dict | None. "
+     "Snapshot variant of `get`."},
     {NULL, NULL, 0, NULL},
 };
 

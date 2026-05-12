@@ -32,6 +32,23 @@ from .errors import (
     from_status,
 )
 
+# Phase 7: hand the libpyx function-pointer addresses to the C
+# extension so its `get` / `snapshot_get` paths can call into libpyx
+# directly, bypassing ctypes for the single-doc-read hot path. The
+# bind is a no-op if the C extension isn't available; the fallback
+# is the pure-ctypes path further down.
+_native_get_bound = False
+if _native_mod is not None and hasattr(_native_mod, "bind"):
+    try:
+        _native_mod.bind(
+            C.cast(_ffi.pyx_get_zero_copy, C.c_void_p).value or 0,
+            C.cast(_ffi.pyx_snapshot_get_zero_copy, C.c_void_p).value or 0,
+            C.cast(_ffi.pyx_last_error, C.c_void_p).value or 0,
+        )
+        _native_get_bound = True
+    except Exception:
+        _native_get_bound = False
+
 __all__ = [
     "Bound",
     "Collection",
@@ -408,6 +425,16 @@ class Collection:
         ))
 
     def get(self, doc_id: int) -> Optional[dict]:
+        # Phase 7 fast path: skip ctypes entirely — the C extension calls
+        # `pyx_get_zero_copy` via a bound function pointer and decodes
+        # the value directly into a Python dict, all without a second
+        # round-trip into ctypes for `pyx_buf_free`.
+        if _native_get_bound:
+            handle = self._db._handle
+            db_int = handle.value if handle else 0
+            if not db_int:
+                raise PyxError(_ffi.PYX_INVALID_ARG, "db is closed")
+            return _native_mod.get(db_int, self._name_bytes, doc_id)
         buf = _ffi.PyxBuf()
         rc = _ffi.pyx_get(
             self._db._handle, self._name_bytes, len(self._name_bytes),
@@ -668,6 +695,12 @@ class SnapshotCollection:
         self._name_bytes = name.encode("utf-8")
 
     def get(self, doc_id: int) -> Optional[dict]:
+        if _native_get_bound:
+            handle = self._snap._handle
+            snap_int = handle.value if handle else 0
+            if not snap_int:
+                raise PyxError(_ffi.PYX_INVALID_ARG, "snapshot is closed")
+            return _native_mod.snapshot_get(snap_int, self._name_bytes, doc_id)
         buf = _ffi.PyxBuf()
         rc = _ffi.pyx_snapshot_get(
             self._snap._handle, self._name_bytes, len(self._name_bytes),

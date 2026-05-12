@@ -301,6 +301,50 @@ pub const View = struct {
         }
     }
 
+    /// Caller-allocated variant of `get` — copies the matched value into
+    /// `out` and writes the byte length into `out_len.*`. Returns `true`
+    /// on hit, `false` on miss. If the value is larger than `out`,
+    /// `out_len.*` is still set to the required size and
+    /// `error.BufferTooSmall` is returned so the caller can retry with a
+    /// larger buffer. Avoids the per-get heap allocation that `get` does
+    /// — the hot single-id read path under the Python binding.
+    pub fn getInto(self: View, key: []const u8, out: []u8, out_len: *usize) !bool {
+        out_len.* = 0;
+        if (self.root == 0) return false;
+        var current = self.root;
+        var scratch: [page_size]u8 = undefined;
+        while (true) {
+            const page = try self.readPage(current, &scratch);
+            const hdr = readHeader(page);
+            if (hdr.type == .leaf) {
+                var i: u16 = 0;
+                while (i < hdr.num_keys) : (i += 1) {
+                    const e = readLeafEntry(page, slotOffset(page, i));
+                    switch (mem.order(u8, key, e.key)) {
+                        .lt => return false,
+                        .eq => {
+                            out_len.* = e.value.len;
+                            if (e.value.len > out.len) return error.BufferTooSmall;
+                            @memcpy(out[0..e.value.len], e.value);
+                            return true;
+                        },
+                        .gt => {},
+                    }
+                }
+                return false;
+            }
+            if (hdr.type != .internal) return Error.CorruptNode;
+            var child: PageId = hdr.leftmost_child;
+            var i: u16 = 0;
+            while (i < hdr.num_keys) : (i += 1) {
+                const e = readInternalEntry(page, slotOffset(page, i));
+                if (mem.order(u8, key, e.key) == .lt) break;
+                child = e.child;
+            }
+            current = child;
+        }
+    }
+
     pub fn iterator(self: View, allocator: Allocator) !Iterator {
         return self.iteratorFromOpt(allocator, null);
     }
@@ -560,6 +604,10 @@ pub const BTree = struct {
 
     pub fn get(self: BTree, allocator: Allocator, key: []const u8) !?[]u8 {
         return self.view().get(allocator, key);
+    }
+
+    pub fn getInto(self: BTree, key: []const u8, out: []u8, out_len: *usize) !bool {
+        return self.view().getInto(key, out, out_len);
     }
 
     pub fn iterator(self: BTree, allocator: Allocator) !Iterator {
