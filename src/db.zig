@@ -739,6 +739,21 @@ pub const Collection = struct {
         return self.btree().get(allocator, key_buf[0..key_len]);
     }
 
+    /// Caller-allocated variant of `get` — skips the per-call heap alloc
+    /// that `get` does. Writes the value into `out`, sets `out_len.*` to
+    /// the value's byte length, and returns `true` on hit. On miss
+    /// returns `false` with `out_len.* = 0`. Returns `error.BufferTooSmall`
+    /// (with `out_len.*` set to the required size) if `out` is too small.
+    pub fn getInto(self: Collection, doc_id: u64, out: []u8, out_len: *usize) !bool {
+        try validateName(self.name);
+        const locked = !self.db.ownsTxn();
+        if (locked) self.db.mu.lockUncancelable(self.db.pager.io);
+        defer if (locked) self.db.mu.unlock(self.db.pager.io);
+        var key_buf: [max_full_key_size]u8 = undefined;
+        const key_len = encodeKey(&key_buf, self.name, doc_id);
+        return self.btree().getInto(key_buf[0..key_len], out, out_len);
+    }
+
     /// Phase 4 / 5A batched lookup. For small batches (`< 128` ids)
     /// each id gets its own tree descent — same shape as `Collection.get`
     /// in a loop, but bundled into a single C call so Python doesn't
@@ -1111,6 +1126,23 @@ pub const SnapshotCollection = struct {
         var key_buf: [max_full_key_size]u8 = undefined;
         const key_len = encodeKey(&key_buf, self.name, doc_id);
         return self.view().get(allocator, key_buf[0..key_len]);
+    }
+
+    /// Caller-allocated variant of `get`. Same semantics as
+    /// `Collection.getInto`.
+    pub fn getInto(self: SnapshotCollection, doc_id: u64, out: []u8, out_len: *usize) !bool {
+        try validateName(self.name);
+        if (self.snapshot.lock_free) {
+            var key_buf: [max_full_key_size]u8 = undefined;
+            const key_len = encodeKey(&key_buf, self.name, doc_id);
+            return self.view().getInto(key_buf[0..key_len], out, out_len);
+        }
+        const locked = !self.snapshot.db.ownsTxn();
+        if (locked) self.snapshot.db.mu.lockUncancelable(self.snapshot.db.pager.io);
+        defer if (locked) self.snapshot.db.mu.unlock(self.snapshot.db.pager.io);
+        var key_buf: [max_full_key_size]u8 = undefined;
+        const key_len = encodeKey(&key_buf, self.name, doc_id);
+        return self.view().getInto(key_buf[0..key_len], out, out_len);
     }
 
     pub fn iterator(self: SnapshotCollection, allocator: Allocator) !Iterator {

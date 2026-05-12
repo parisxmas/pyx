@@ -8,6 +8,56 @@ tag goes under `## Unreleased`.
 ## Unreleased
 
 ### Added
+- Phase 7: **native single-doc get path** — closes the W2 gap.
+
+  Two pieces:
+
+  1. New C ABI `pyx_get_zero_copy(db, coll, coll_len, doc_id, out_buf,
+     out_buf_cap, *out_len)` (+ snapshot variant). Caller-allocated
+     buffer; no `pyx_buf_free` round-trip. Returns `ok` /
+     `not_found` / `buffer_too_small` with `*out_len` set to either
+     the bytes written or the required size. Backed by a new
+     `View.getInto` / `BTree.getInto` / `Collection.getInto` /
+     `SnapshotCollection.getInto` quartet that copies the value
+     directly into the caller's buffer — no per-get heap dupe like
+     `View.get` does.
+
+  2. `pyx._native` gains a `bind(get_addr, snap_get_addr,
+     last_error_addr)` entry point. At binding import time we hand
+     it the three libpyx function-pointer addresses (via
+     `ctypes.cast(_ffi.fn, c_void_p).value`); the C extension stores
+     them as raw function pointers. Then `_native.get(db_int,
+     coll_bytes, doc_id) -> dict | None` calls libpyx directly and
+     decodes in-place into a Python dict — **the entire single-doc
+     read path skips ctypes**. `_native.snapshot_get` mirrors it
+     for snapshots. 4 KiB on-stack scratch covers every pyx doc
+     (`max_value_size = 1024`); the BUFFER_TOO_SMALL retry path
+     stays for future-proofing.
+
+  Python `Collection.get` / `SnapshotCollection.get` dispatch
+  through the native path when bound and fall back to the
+  pure-ctypes `pyx_get` + `pyx_buf_free` path when the C extension
+  isn't available.
+
+  Bench delta (W2 = 20k single-id `c.get(id)` calls):
+
+      W2 random reads — before:  62.6 ms   320 kops/s   ratio 0.43x
+      W2 random reads — after:   26.6 ms   750 kops/s   ratio 0.95x
+
+  i.e. ~2.3× faster on the Python side, basically at parity with
+  SQLite's prepared-statement `SELECT … WHERE id = ?` path. The
+  remaining gap is per-id B-tree descent — there is no sorted-scan
+  analogue for a literal single `get`. Full pyx-vs-sqlite table after
+  phase 7:
+
+      W1  seq inserts:    0.85x
+      W1b bulk insert:    0.62x
+      W2  random reads:   0.95x   ← phase 7
+      W2b batched/256:    0.63x
+      W3  multi-coll:     1.40x   (pyx faster — phase 3 win)
+
+  41 Python tests still pass.
+
 - Phase 6: **batched insert API** + **native encode**.
 
   `Collection.insert_many(docs)` wraps N inserts in one

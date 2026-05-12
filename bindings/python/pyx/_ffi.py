@@ -178,6 +178,25 @@ pyx_get = _bind(
     C.c_void_p, C.c_char_p, C.c_size_t, C.c_uint64,
     C.POINTER(PyxBuf),
 )
+
+# Phase 7: caller-allocated single-doc get. We expose it as a ctypes
+# binding for completeness, but the hot path is the function-pointer
+# address passed to `_native.bind` so the C extension can call it
+# directly without ctypes glue.
+pyx_get_zero_copy = _bind(
+    "pyx_get_zero_copy",
+    C.c_int,
+    C.c_void_p, C.c_char_p, C.c_size_t, C.c_uint64,
+    C.POINTER(C.c_uint8), C.c_size_t,
+    C.POINTER(C.c_size_t),
+)
+pyx_snapshot_get_zero_copy = _bind(
+    "pyx_snapshot_get_zero_copy",
+    C.c_int,
+    C.c_void_p, C.c_char_p, C.c_size_t, C.c_uint64,
+    C.POINTER(C.c_uint8), C.c_size_t,
+    C.POINTER(C.c_size_t),
+)
 pyx_delete = _bind(
     "pyx_delete",
     C.c_int,
