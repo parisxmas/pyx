@@ -241,6 +241,13 @@ pub const Pager = struct {
     /// across processes. Multi-reader visibility (wal-index) lands in
     /// phase 2.
     shm: shm_mod.Shm,
+    /// True between `Pager.open` and `finishOpen()`. While set, we
+    /// still hold byte 0 EXCL — concurrent committers in other
+    /// processes (which take byte 0 SHARED in `begin`) block until
+    /// `Db.open` finishes WAL replay and calls `finishOpen()`. Closes
+    /// the recovery race where a fresh attacher's replay used to
+    /// interleave with another process's commit.
+    open_lock_held: bool,
 
     pub fn open(allocator: Allocator, io: Io, dir: Dir, sub_path: []const u8) !Pager {
         const file = try dir.createFile(io, sub_path, .{
@@ -325,9 +332,12 @@ pub const Pager = struct {
         var wal = try wal_mod.Wal.open(allocator, io, dir, wal_path, shm.walEndOffset());
         errdefer wal.close();
 
-        // Open complete. Release the WRITER lock so other processes
-        // (whether opening or committing) can proceed.
-        flock_mod.unlock(file.handle, writer_lock_region) catch {};
+        // Hand byte 0 EXCL ownership to the returned Pager: `Db.open`
+        // calls `finishOpen()` after WAL replay to drop it. Concurrent
+        // committers in other processes block on their byte-0-SHARED
+        // acquisition (in `begin`) until then — without this hold,
+        // their commit racing our replay was the long-standing
+        // InvalidPageId flake.
         open_writer_held = false;
 
         return .{
@@ -348,7 +358,16 @@ pub const Pager = struct {
             .txn_append_hint = null,
             .sync_mode = .full,
             .shm = shm,
+            .open_lock_held = true,
         };
+    }
+
+    /// Release the byte-0 EXCL lock that `open()` held for us. Called
+    /// by `Db.open` after WAL replay finishes. Idempotent.
+    pub fn finishOpen(self: *Pager) void {
+        if (!self.open_lock_held) return;
+        flock_mod.unlock(self.file.handle, writer_lock_region) catch {};
+        self.open_lock_held = false;
     }
 
     pub fn setSyncMode(self: *Pager, mode: SyncMode) void {
@@ -369,6 +388,11 @@ pub const Pager = struct {
         self.txn_arena.deinit();
         self.wal.close();
         self.shm.close();
+        // Defensive: if `Db.open` errored between `Pager.open` and the
+        // matching `finishOpen()`, we still hold byte 0 EXCL. Drop it
+        // before the fd close so other processes don't have to wait
+        // for the kernel's implicit-on-fd-close release.
+        self.finishOpen();
         self.file.close(self.io);
         self.* = undefined;
     }
@@ -472,6 +496,20 @@ pub const Pager = struct {
     pub fn begin(self: *Pager, collection_id: CollectionId) !void {
         if (self.in_txn) return Error.TxnAlreadyActive;
         std.debug.assert(collection_id < max_collections);
+        // Byte 0 SHARED: a peer's open path holds byte 0 EXCL across
+        // its WAL replay (see `Pager.open` + `Db.open.finishOpen`), so
+        // grabbing SHARED here makes our commit wait until that
+        // replay is done. SHARED-vs-SHARED doesn't conflict, so two
+        // peers committing concurrently in different collections still
+        // run in parallel. Skipped during recovery — we already hold
+        // byte 0 EXCL from open-time, and fcntl is per-process so a
+        // SHARED request would either no-op or downgrade.
+        if (!self.in_recovery) {
+            try flock_mod.lock(self.file.handle, .read, writer_lock_region);
+        }
+        errdefer if (!self.in_recovery) {
+            flock_mod.unlock(self.file.handle, writer_lock_region) catch {};
+        };
         // Per-collection WRITER lock (sharding phase 3) — only commits
         // to the SAME collection serialise. Writers to different
         // collections can be in begin → applyAndFinalize concurrently
@@ -676,6 +714,10 @@ pub const Pager = struct {
         self.txn_collection_id = null;
         if (!self.in_recovery) {
             flock_mod.unlock(self.file.handle, collectionWriterLockRegion(cid)) catch {};
+            // Release the byte-0 SHARED we took in begin (see comment
+            // there). A peer's open path can now make forward progress
+            // on its byte-0 EXCL acquisition for replay.
+            flock_mod.unlock(self.file.handle, writer_lock_region) catch {};
         }
     }
 
@@ -697,6 +739,7 @@ pub const Pager = struct {
         self.txn_collection_id = null;
         if (!self.in_recovery) {
             flock_mod.unlock(self.file.handle, collectionWriterLockRegion(cid)) catch {};
+            flock_mod.unlock(self.file.handle, writer_lock_region) catch {};
         }
     }
 

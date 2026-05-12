@@ -7,6 +7,39 @@ tag goes under `## Unreleased`.
 
 ## Unreleased
 
+### Fixed
+- **Multi-process WAL-replay race** that surfaced as intermittent
+  `InvalidPageId` in `pyx_open` / `pyx_insert` under the bench's W4
+  (4 processes inserting into a shared collection). Pre-fix flake
+  rate measured at ~1-in-5 runs; post-fix 0-in-20.
+
+  Root cause: `Pager.open` released byte 0 EXCL before `Db.open`
+  ran `replayWal`. Replay writes to the data file and shm without
+  any cross-process lock, so a peer process committing concurrently
+  could interleave its `numPages`/`btreeRoot` updates with replay's
+  re-application of the same WAL records — corrupting the live tree
+  or, when the next read followed a freshly-clobbered child pointer,
+  raising `InvalidPageId`.
+
+  Fix: byte 0 now stays held across replay. New
+  `Pager.finishOpen()` releases it; `Db.open` calls it after
+  `replayWal`. Every commit's `begin` now takes byte 0 SHARED
+  (released in `applyAndFinalize` / `abort`). SHARED↔SHARED doesn't
+  conflict, so concurrent commits in different collections still
+  run in parallel. SHARED↔EXCL conflicts, so an opener's replay
+  serialises against any in-flight commit and vice-versa. Same
+  pattern SQLite uses for `pragma synchronous` plus journal-mode
+  serialisation. `close()` also defensively releases the open lock
+  if `finishOpen()` never ran (early error path).
+
+  Cost: 2 extra fcntl syscalls per commit (byte 0 SHARED lock +
+  unlock). On macOS advisory locks this is ~hundreds of ns — about
+  -4% on the in-process `bench-concurrent` Phase C single-writer
+  number (24.5k → 23.6k commits/s) and -10% on the Python W1
+  single-process auto-commit number (33k → 30k commits/s). On
+  Linux record-locks the percentage is smaller because fsync
+  dominates more. All 41 Python tests + the full Zig suite pass.
+
 ### Added
 - Phase 7: **native single-doc get path** — closes the W2 gap.
 
